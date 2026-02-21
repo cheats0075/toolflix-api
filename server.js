@@ -115,7 +115,7 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
     for(const j of jogos){
       const title = j.title || j.nome || "";
       const link  = j.link  || j.url  || "";
-      const image = j.image || j.img  || "";
+      const image = j.image || j.img || j.capa || j.thumb || j.imagem || j.cover || j.thumbnail || "";
 
       if(!title || !link) continue;
 
@@ -203,3 +203,4 @@ app.get("/api/total-premium", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*)::int AS total FROM premium_users`);
   res.json({ ok:true, totalPremium:r.rows[0].total });
 });
+
