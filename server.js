@@ -11,7 +11,7 @@ app.use(cors({ origin: "*" }));
 // Banco
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  ssl: { rejectUnauthorized: false }
 });
 
 // Admin
@@ -133,9 +133,11 @@ app.get("/api/total-premium", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
+app.listen(PORT, () => console.log("ToolFlix API rodando na porta", PORT));
+
 initDb()
-  .then(() => app.listen(PORT, () => console.log("ToolFlix API rodando na porta", PORT)))
+  .then(() => console.log("✅ Banco OK (tabelas prontas)"))
   .catch((e) => {
-    console.error("Erro initDb:", e);
-    process.exit(1);
+    console.error("❌ Erro initDb (banco):", e);
   });
+
