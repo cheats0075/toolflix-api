@@ -111,6 +111,7 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
     const jogos = Array.isArray(data) ? data : (data.jogos || []);
 
     let inserted = 0;
+let updated = 0;
 
     for(const j of jogos){
       const title = j.title || j.nome || "";
@@ -120,10 +121,18 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
       if(!title || !link) continue;
 
       const exists = await pool.query(
-        `SELECT 1 FROM games WHERE link=$1 LIMIT 1`,
-        [link]
-      );
-      if(exists.rowCount > 0) continue;
+  `SELECT image FROM games WHERE link=$1 LIMIT 1`,
+  [link]
+);
+
+if(exists.rowCount > 0){
+  const currentImage = (exists.rows[0].image || "").trim();
+  if(!currentImage && image){
+    await pool.query(`UPDATE games SET image=$1 WHERE link=$2`, [image, link]);
+    updated++;
+  }
+  continue;
+}
 
       const id = "g_" + Math.random().toString(36).slice(2, 10);
       const createdAt = Date.now();
@@ -137,7 +146,7 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
       inserted++;
     }
 
-    res.json({ ok: true, inserted });
+    res.json({ ok: true, inserted, updated });
 
   }catch(e){
     console.error(e);
@@ -203,5 +212,6 @@ app.get("/api/total-premium", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*)::int AS total FROM premium_users`);
   res.json({ ok:true, totalPremium:r.rows[0].total });
 });
+
 
 
