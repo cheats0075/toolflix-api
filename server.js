@@ -145,4 +145,18 @@ app.get("/api/total-premium", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => console.log("ToolFlix API rodando na porta", PORT));
+// DEBUG: ver quantos tokens existem e os últimos 5 (apenas pra teste)
+app.get("/api/admin/debug-tokens", (req, res) => {
+  const tokens = readJson(TOKENS_FILE);
+  res.json({
+    ok: true,
+    total: tokens.length,
+    last5: tokens.slice(0, 5).map(t => ({
+      token: t.token,
+      expiresAt: t.expiresAt,
+      usedBy: t.usedBy
+    }))
+  });
+});
