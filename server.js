@@ -1,4 +1,7 @@
-// server.js — ToolFlix API (Render + Postgres)
+// server.js — ToolFlix API (Render + Postgres) — COMPLETO
+// ✅ Games + Tokens + Premium (como antes)
+// ✅ Login (nick+senha) + JWT 30 dias
+// ✅ XP sincronizado via /api/add-xp
 
 const express = require("express");
 const cors = require("cors");
@@ -12,18 +15,13 @@ app.use(express.json());
 app.use(cors({ origin: "*" }));
 
 const PORT = process.env.PORT || 3000;
+const ADMIN_KEY = process.env.ADMIN_KEY || "CHANGE_ME";
 const JWT_SECRET = process.env.JWT_SECRET || "TOOLFLIX_SECRET_123";
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
-
-const ADMIN_KEY = process.env.ADMIN_KEY || "CHANGE_ME";
-
-/* =========================
-   ADMIN
-========================= */
 
 function requireAdmin(req, res, next) {
   const key = req.headers["x-admin-key"];
@@ -33,32 +31,39 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-/* =========================
-   AUTH MIDDLEWARE
-========================= */
-
 function auth(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header) return res.status(401).json({ ok: false, error: "NO_TOKEN" });
-
-  const token = header.split(" ")[1];
-  if (!token) return res.status(401).json({ ok: false, error: "INVALID_TOKEN" });
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (!token) return res.status(401).json({ ok: false, error: "NO_TOKEN" });
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
+    req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch {
-    return res.status(401).json({ ok: false, error: "TOKEN_EXPIRED" });
+    return res.status(401).json({ ok: false, error: "TOKEN_INVALID" });
   }
 }
 
-/* =========================
-   INIT DB
-========================= */
+function fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, (resp) => {
+        let data = "";
+        resp.on("data", (chunk) => (data += chunk));
+        resp.on("end", () => {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      })
+      .on("error", reject);
+  });
+}
 
 async function initDb() {
-
+  // USERS (Login + XP)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users(
       id TEXT PRIMARY KEY,
@@ -68,11 +73,9 @@ async function initDb() {
       created_at BIGINT NOT NULL
     );
   `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS users_nick_idx ON users(nick);`);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS users_nick_idx ON users(nick);
-  `);
-
+  // GAMES
   await pool.query(`
     CREATE TABLE IF NOT EXISTS games(
       id TEXT PRIMARY KEY,
@@ -93,10 +96,9 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS premium BOOLEAN DEFAULT false;
   `);
 
-  await pool.query(`
-    CREATE UNIQUE INDEX IF NOT EXISTS games_link_unique ON games(link);
-  `);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS games_link_unique ON games(link);`);
 
+  // TOKENS
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tokens(
       token TEXT PRIMARY KEY,
@@ -113,25 +115,34 @@ async function initDb() {
       since BIGINT NOT NULL
     );
   `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS tokens_used_by_idx ON tokens(used_by);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS tokens_expires_idx ON tokens(expires_at);`);
 }
 
-initDb().then(() => {
-  console.log("✅ Banco OK");
-  app.listen(PORT, () =>
-    console.log("ToolFlix API rodando na porta", PORT)
-  );
-});
+initDb()
+  .then(() => {
+    console.log("✅ Banco OK");
+    app.listen(PORT, () => console.log("ToolFlix API rodando na porta", PORT));
+  })
+  .catch((e) => {
+    console.error("❌ Erro initDb:", e);
+    app.listen(PORT, () => console.log("ToolFlix API (COM ERRO DB) na porta", PORT));
+  });
+
+app.get("/", (req, res) => res.json({ ok: true, name: "ToolFlix API" }));
 
 /* =========================
-   REGISTER
+   AUTH (REGISTER/LOGIN)
 ========================= */
 
 app.post("/api/register", async (req, res) => {
   try {
-    const { nick, password } = req.body;
+    const nick = (req.body?.nick || "").toString().trim();
+    const password = (req.body?.password || "").toString();
 
-    if (!nick || !password)
-      return res.status(400).json({ ok: false, error: "Dados obrigatórios" });
+    if (!nick) return res.status(400).json({ ok: false, error: "NICK_REQUIRED" });
+    if (!password || password.length < 6) return res.status(400).json({ ok: false, error: "PASS_MIN_6" });
 
     const hash = await bcrypt.hash(password, 10);
     const id = "u_" + Math.random().toString(36).slice(2, 10);
@@ -140,102 +151,275 @@ app.post("/api/register", async (req, res) => {
     await pool.query(
       `INSERT INTO users(id,nick,password_hash,xp,created_at)
        VALUES($1,$2,$3,0,$4)`,
-      [id, nick.trim(), hash, createdAt]
+      [id, nick, hash, createdAt]
     );
 
     res.json({ ok: true });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: "Nick já existe" });
+  } catch {
+    res.status(400).json({ ok: false, error: "NICK_EXISTS" });
   }
 });
 
-/* =========================
-   LOGIN
-========================= */
-
 app.post("/api/login", async (req, res) => {
   try {
-    const { nick, password } = req.body;
+    const nick = (req.body?.nick || "").toString().trim();
+    const password = (req.body?.password || "").toString();
 
-    const r = await pool.query(
-      `SELECT * FROM users WHERE nick=$1 LIMIT 1`,
-      [nick.trim()]
-    );
-
-    if (r.rowCount === 0)
-      return res.status(401).json({ ok: false, error: "Usuário inválido" });
+    const r = await pool.query(`SELECT * FROM users WHERE nick=$1 LIMIT 1`, [nick]);
+    if (r.rowCount === 0) return res.status(401).json({ ok: false, error: "INVALID" });
 
     const user = r.rows[0];
-
     const match = await bcrypt.compare(password, user.password_hash);
-    if (!match)
-      return res.status(401).json({ ok: false, error: "Senha inválida" });
+    if (!match) return res.status(401).json({ ok: false, error: "INVALID" });
 
-    const token = jwt.sign(
-      { id: user.id, nick: user.nick },
-      JWT_SECRET,
-      { expiresIn: "30d" }
-    );
+    const token = jwt.sign({ id: user.id, nick: user.nick }, JWT_SECRET, { expiresIn: "30d" });
 
     res.json({
       ok: true,
       token,
-      user: {
-        id: user.id,
-        nick: user.nick,
-        xp: Number(user.xp)
-      }
+      user: { id: user.id, nick: user.nick, xp: Number(user.xp || 0) },
     });
-
-  } catch {
+  } catch (e) {
+    console.error("LOGIN_FAIL:", e);
     res.status(500).json({ ok: false, error: "LOGIN_FAIL" });
   }
 });
 
-/* =========================
-   GET PROFILE
-========================= */
-
 app.get("/api/me", auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT id,nick,xp FROM users WHERE id=$1`,
-    [req.user.id]
-  );
-
-  if (r.rowCount === 0)
-    return res.status(404).json({ ok: false });
-
+  const r = await pool.query(`SELECT id,nick,xp FROM users WHERE id=$1 LIMIT 1`, [req.user.id]);
+  if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
   res.json({ ok: true, user: r.rows[0] });
 });
 
-/* =========================
-   ADD XP (Tempo real)
-========================= */
-
 app.post("/api/add-xp", auth, async (req, res) => {
-  const { amount } = req.body;
-  const xpGain = Number(amount) || 0;
+  const amount = Number(req.body?.amount || 0);
+  if (amount <= 0 || amount > 1000) return res.status(400).json({ ok: false, error: "AMOUNT_INVALID" });
 
-  if (xpGain <= 0 || xpGain > 1000)
-    return res.status(400).json({ ok: false });
+  await pool.query(`UPDATE users SET xp = xp + $1 WHERE id=$2`, [amount, req.user.id]);
+  const r = await pool.query(`SELECT xp FROM users WHERE id=$1 LIMIT 1`, [req.user.id]);
 
-  await pool.query(
-    `UPDATE users SET xp = xp + $1 WHERE id=$2`,
-    [xpGain, req.user.id]
-  );
-
-  const r = await pool.query(
-    `SELECT xp FROM users WHERE id=$1`,
-    [req.user.id]
-  );
-
-  res.json({ ok: true, xp: Number(r.rows[0].xp) });
+  res.json({ ok: true, xp: Number(r.rows[0]?.xp || 0) });
 });
 
 /* =========================
-   ROOT
+   GAMES
 ========================= */
 
-app.get("/", (req, res) =>
-  res.json({ ok: true, name: "ToolFlix API" })
-);
+app.get("/api/games", async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM games ORDER BY created_at DESC;`);
+    res.json({ ok: true, games: r.rows });
+  } catch (e) {
+    console.error("GAMES_GET_FAIL:", e);
+    res.status(500).json({ ok: false, error: "GAMES_GET_FAIL" });
+  }
+});
+
+app.post("/api/admin/clear-games", requireAdmin, async (req, res) => {
+  try {
+    await pool.query(`DELETE FROM games;`);
+    res.json({ ok: true, cleared: true });
+  } catch (e) {
+    console.error("CLEAR_GAMES_FAIL:", e);
+    res.status(500).json({ ok: false, error: "CLEAR_GAMES_FAIL" });
+  }
+});
+
+app.post("/api/admin/games", requireAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const title = (body.title || "").toString().trim();
+    const link = (body.link || "").toString().trim();
+    const image = (body.image || "").toString().trim();
+    const category = (body.category || "").toString().trim();
+    const premium = !!body.premium;
+
+    if (!title || !link) return res.status(400).json({ ok: false, error: "title e link obrigatórios" });
+
+    const id = "g_" + Math.random().toString(36).slice(2, 10);
+    const createdAt = Date.now();
+
+    await pool.query(
+      `
+      INSERT INTO games(id,title,link,image,category,premium,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (link) DO UPDATE
+      SET title = EXCLUDED.title,
+          image = COALESCE(NULLIF(EXCLUDED.image,''), games.image),
+          category = COALESCE(NULLIF(EXCLUDED.category,''), games.category),
+          premium = EXCLUDED.premium
+      `,
+      [id, title, link, image, category, premium, createdAt]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("ADMIN_GAMES_UPSERT_FAIL:", e);
+    res.status(500).json({ ok: false, error: "ADMIN_GAMES_UPSERT_FAIL" });
+  }
+});
+
+app.post("/api/admin/games/delete", requireAdmin, async (req, res) => {
+  try {
+    const { link } = req.body || {};
+    if (!link) return res.status(400).json({ ok: false, error: "link obrigatório" });
+
+    const r = await pool.query(`DELETE FROM games WHERE link=$1`, [String(link).trim()]);
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (e) {
+    console.error("DELETE_GAME_FAIL:", e);
+    res.status(500).json({ ok: false, error: "DELETE_GAME_FAIL" });
+  }
+});
+
+app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
+  const url = "https://raw.githubusercontent.com/cheats0075/toolflix/main/toolflix_backup.json";
+
+  try {
+    const data = await fetchJson(url);
+    const jogos = Array.isArray(data) ? data : data.jogos || [];
+
+    if (!Array.isArray(jogos) || jogos.length === 0) {
+      return res.json({ ok: false, error: "SEM_JOGOS_NO_JSON" });
+    }
+
+    let inserted = 0, updated = 0, skipped = 0;
+
+    for (const j of jogos) {
+      const title = (j.nome || "").toString().trim();
+      const link = (j.link || "").toString().trim();
+      const image = (j.capa || "").toString().trim();
+      const category = (j.categoria || "").toString().trim();
+      const premium = !!j.premium || category === "Premium";
+
+      if (!title || !link) { skipped++; continue; }
+
+      const exists = await pool.query(`SELECT title,image,category,premium FROM games WHERE link=$1 LIMIT 1`, [link]);
+
+      if (exists.rowCount > 0) {
+        const cur = exists.rows[0];
+        const needUpdate =
+          (image && image !== (cur.image || "")) ||
+          (category && category !== (cur.category || "")) ||
+          (title && title !== (cur.title || "")) ||
+          (premium !== !!cur.premium);
+
+        if (needUpdate) {
+          await pool.query(
+            `UPDATE games SET title=$1, image=$2, category=$3, premium=$4 WHERE link=$5`,
+            [title, image || cur.image || "", category || cur.category || "", premium, link]
+          );
+          updated++;
+        }
+        continue;
+      }
+
+      const id = "g_" + Math.random().toString(36).slice(2, 10);
+      const createdAt = Date.now();
+
+      await pool.query(
+        `INSERT INTO games(id,title,link,image,category,premium,created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7)`,
+        [id, title, link, image, category, premium, createdAt]
+      );
+      inserted++;
+    }
+
+    res.json({ ok: true, totalNoJson: jogos.length, inserted, updated, skipped });
+  } catch (e) {
+    console.error("IMPORT_FAIL:", e);
+    res.status(500).json({ ok: false, error: "IMPORT_FAIL", details: String(e) });
+  }
+});
+
+/* =========================
+   TOKENS + PREMIUM USERS
+========================= */
+
+app.post("/api/admin/tokens", requireAdmin, async (req, res) => {
+  try {
+    const { days = 30 } = req.body || {};
+    const now = Date.now();
+    const expiresAt = now + Number(days) * 24 * 60 * 60 * 1000;
+
+    const token =
+      "TFX-" +
+      Math.random().toString(36).toUpperCase().slice(2, 8) +
+      "-" +
+      Math.random().toString(36).toUpperCase().slice(2, 8);
+
+    await pool.query(
+      `INSERT INTO tokens(token,created_at,expires_at,used_by,used_at)
+       VALUES($1,$2,$3,NULL,NULL)`,
+      [token, now, expiresAt]
+    );
+
+    res.json({ ok: true, token: { token, createdAt: now, expiresAt } });
+  } catch (e) {
+    console.error("ADMIN_TOKEN_CREATE_FAIL:", e);
+    res.status(500).json({ ok: false, error: "ADMIN_TOKEN_CREATE_FAIL" });
+  }
+});
+
+app.post("/api/validar-token", async (req, res) => {
+  try {
+    const token = (req.body?.token || "").toString().trim().toUpperCase();
+    const userId = (req.body?.userId || "").toString().trim();
+
+    if (!token || !userId) {
+      return res.status(400).json({ ok: false, error: "token e userId obrigatórios" });
+    }
+
+    const r = await pool.query(`SELECT * FROM tokens WHERE token=$1`, [token]);
+    if (r.rowCount === 0) return res.json({ ok: false, valid: false, reason: "TOKEN_INEXISTENTE" });
+
+    const t = r.rows[0];
+    const now = Date.now();
+
+    if (now > Number(t.expires_at)) return res.json({ ok: false, valid: false, reason: "TOKEN_EXPIRADO" });
+    if (t.used_by && t.used_by !== userId) return res.json({ ok: false, valid: false, reason: "TOKEN_JA_USADO" });
+
+    await pool.query(`UPDATE tokens SET used_by=$1, used_at=$2 WHERE token=$3`, [userId, now, token]);
+
+    await pool.query(
+      `INSERT INTO premium_users(user_id, since) VALUES($1,$2)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId, now]
+    );
+
+    res.json({ ok: true, valid: true, userId });
+  } catch (e) {
+    console.error("VALIDAR_TOKEN_FAIL:", e);
+    res.status(500).json({ ok: false, error: "VALIDAR_TOKEN_FAIL" });
+  }
+});
+
+app.post("/api/validate-token", async (req, res) => {
+  req.url = "/api/validar-token";
+  return app._router.handle(req, res, () => {});
+});
+
+app.get("/api/is-premium/:userId", async (req, res) => {
+  try {
+    const userId = (req.params.userId || "").toString().trim();
+    if (!userId) return res.status(400).json({ ok: false, error: "userId obrigatório" });
+
+    const r = await pool.query(`SELECT user_id, since FROM premium_users WHERE user_id=$1 LIMIT 1`, [userId]);
+    if (r.rowCount === 0) return res.json({ ok: true, premium: false });
+
+    res.json({ ok: true, premium: true, since: Number(r.rows[0].since || 0) });
+  } catch (e) {
+    console.error("IS_PREMIUM_FAIL:", e);
+    res.status(500).json({ ok: false, error: "IS_PREMIUM_FAIL" });
+  }
+});
+
+app.get("/api/total-premium", async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT COUNT(*)::int AS total FROM premium_users`);
+    res.json({ ok: true, totalPremium: r.rows[0].total });
+  } catch (e) {
+    console.error("TOTAL_PREMIUM_FAIL:", e);
+    res.status(500).json({ ok: false, error: "TOTAL_PREMIUM_FAIL" });
+  }
+});
