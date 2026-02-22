@@ -110,6 +110,19 @@ initDb()
     // still start to expose error endpoint
     app.listen(PORT, () => console.log("ToolFlix API (COM ERRO DB) na porta", PORT));
   });
+// Deletar jogo por link (admin)
+app.post("/api/admin/games/delete", requireAdmin, async (req, res) => {
+  try {
+    const { link } = req.body || {};
+    if (!link) return res.status(400).json({ ok: false, error: "link obrigatório" });
+
+    const r = await pool.query(`DELETE FROM games WHERE link=$1`, [String(link).trim()]);
+    res.json({ ok: true, deleted: r.rowCount });
+  } catch (e) {
+    console.error("DELETE_GAME_FAIL:", e);
+    res.status(500).json({ ok: false, error: "DELETE_GAME_FAIL" });
+  }
+});
 
 app.get("/", (req, res) => res.json({ ok: true, name: "ToolFlix API" }));
 
@@ -353,3 +366,4 @@ app.post("/api/validate-token", async (req, res) => {
   req.url = "/api/validar-token";
   return app._router.handle(req, res, () => {});
 });
+
