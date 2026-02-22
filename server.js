@@ -9,13 +9,11 @@ app.use(cors({ origin: "*" }));
 
 const PORT = process.env.PORT || 3000;
 
-// Postgres (Render)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// Admin
 const ADMIN_KEY = process.env.ADMIN_KEY || "CHANGE_ME";
 function requireAdmin(req, res, next) {
   const key = req.headers["x-admin-key"];
@@ -25,7 +23,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Utils
 function fetchJson(url) {
   return new Promise((resolve, reject) => {
     https
@@ -44,7 +41,6 @@ function fetchJson(url) {
   });
 }
 
-// DB init + migration (adds category column)
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS games(
@@ -56,10 +52,15 @@ async function initDb() {
     );
   `);
 
-  // ✅ add category column if missing
+  // add category
   await pool.query(`
     ALTER TABLE games
     ADD COLUMN IF NOT EXISTS category TEXT DEFAULT '';
+  `);
+
+  // ensure link uniqueness by index (prevents duplicates)
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS games_link_unique ON games(link);
   `);
 
   await pool.query(`
@@ -81,6 +82,7 @@ async function initDb() {
 }
 
 app.listen(PORT, () => console.log("ToolFlix API rodando na porta", PORT));
+
 initDb()
   .then(() => console.log("✅ Banco OK"))
   .catch((e) => console.error("❌ Erro initDb:", e));
@@ -96,7 +98,11 @@ app.get("/api/games", async (req, res) => {
   res.json({ ok: true, games: r.rows });
 });
 
-// Admin add game (now supports category)
+app.post("/api/admin/clear-games", requireAdmin, async (req, res) => {
+  await pool.query(`DELETE FROM games;`);
+  res.json({ ok: true, cleared: true });
+});
+
 app.post("/api/admin/games", requireAdmin, async (req, res) => {
   const { title, link, image = "", category = "" } = req.body || {};
   if (!title || !link) return res.status(400).json({ ok: false, error: "title e link obrigatórios" });
@@ -104,23 +110,26 @@ app.post("/api/admin/games", requireAdmin, async (req, res) => {
   const id = "g_" + Math.random().toString(36).slice(2, 10);
   const createdAt = Date.now();
 
+  // upsert by link
   await pool.query(
-    `INSERT INTO games(id,title,link,image,category,created_at)
-     VALUES($1,$2,$3,$4,$5,$6)`,
+    `
+    INSERT INTO games(id,title,link,image,category,created_at)
+    VALUES($1,$2,$3,$4,$5,$6)
+    ON CONFLICT (link) DO UPDATE
+    SET title = EXCLUDED.title,
+        image = COALESCE(NULLIF(EXCLUDED.image,''), games.image),
+        category = COALESCE(NULLIF(EXCLUDED.category,''), games.category)
+    `,
     [id, title, link, image, category, createdAt]
   );
 
-  res.json({ ok: true, id });
-});
-
-// (Opcional) Limpar jogos pra importar do zero
-app.post("/api/admin/clear-games", requireAdmin, async (req, res) => {
-  await pool.query(`DELETE FROM games;`);
-  res.json({ ok: true, cleared: true });
+  res.json({ ok: true });
 });
 
 /* =========================
-   IMPORTAR DO GITHUB → POSTGRES
+   IMPORT DO GITHUB (toolflix_backup.json)
+   FORMATO REAL:
+   { nome, capa, link, categoria }
 ========================= */
 
 app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
@@ -128,9 +137,8 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
 
   try {
     const data = await fetchJson(url);
+    const jogos = Array.isArray(data) ? data : [];
 
-    // pode ser array direto ou {jogos:[...]}
-    const jogos = Array.isArray(data) ? data : (data.jogos || []);
     if (!Array.isArray(jogos) || jogos.length === 0) {
       return res.json({ ok: false, error: "SEM_JOGOS_NO_JSON" });
     }
@@ -140,47 +148,40 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
     let skipped = 0;
 
     for (const j of jogos) {
-      // 🔥 pega título/link/capa/categoria (várias chaves possíveis)
-      const title =
-        (j.title || j.nome || j.name || j.titulo || "").toString().trim();
+      const title = (j.nome || "").toString().trim();
+      const link = (j.link || "").toString().trim();
+      const image = (j.capa || "").toString().trim();
+      const category = (j.categoria || "").toString().trim();
 
-      const link =
-        (j.link || j.url || j.href || j.download || "").toString().trim();
+      if (!title || !link) {
+        skipped++;
+        continue;
+      }
 
-      const image =
-        (j.capa || j.image || j.img || j.thumb || j.imagem || j.cover || "").toString().trim();
-
-      const category =
-        (j.categoria || j.category || j.cat || j.plataforma || j.console || j.sistema || j.tipo || "").toString().trim();
-
-      if (!title || !link) { skipped++; continue; }
-
-      // evita duplicar por link; se existir, atualiza image/category se estiver vazio
+      // Se existir, atualiza (inclusive se mudou)
       const exists = await pool.query(
-        `SELECT image, category FROM games WHERE link=$1 LIMIT 1`,
+        `SELECT title, image, category FROM games WHERE link=$1 LIMIT 1`,
         [link]
       );
 
       if (exists.rowCount > 0) {
         const cur = exists.rows[0];
-        const curImg = (cur.image || "").trim();
-        const curCat = (cur.category || "").trim();
+        const needUpdate =
+          (image && image !== (cur.image || "")) ||
+          (category && category !== (cur.category || "")) ||
+          (title && title !== (cur.title || ""));
 
-        const shouldUpdateImg = !curImg && !!image;
-        const shouldUpdateCat = !curCat && !!category;
-
-        if (shouldUpdateImg || shouldUpdateCat) {
+        if (needUpdate) {
           await pool.query(
-            `UPDATE games SET image = COALESCE(NULLIF(image,''), $1),
-                              category = COALESCE(NULLIF(category,''), $2)
-             WHERE link=$3`,
-            [image, category, link]
+            `UPDATE games SET title=$1, image=$2, category=$3 WHERE link=$4`,
+            [title, image || cur.image || "", category || cur.category || "", link]
           );
           updated++;
         }
         continue;
       }
 
+      // Inserir novo
       const id = "g_" + Math.random().toString(36).slice(2, 10);
       const createdAt = Date.now();
 
@@ -189,11 +190,11 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
          VALUES($1,$2,$3,$4,$5,$6)`,
         [id, title, link, image, category, createdAt]
       );
+
       inserted++;
     }
 
     res.json({ ok: true, totalNoJson: jogos.length, inserted, updated, skipped });
-
   } catch (e) {
     console.error("IMPORT_FAIL:", e);
     res.status(500).json({ ok: false, error: "IMPORT_FAIL", details: String(e) });
