@@ -137,7 +137,7 @@ app.post("/api/admin/import-github-games", requireAdmin, async (req, res) => {
 
   try {
     const data = await fetchJson(url);
-    const jogos = Array.isArray(data) ? data : [];
+   const jogos = Array.isArray(data) ? data : (data.jogos || []);
 
     if (!Array.isArray(jogos) || jogos.length === 0) {
       return res.json({ ok: false, error: "SEM_JOGOS_NO_JSON" });
@@ -251,3 +251,4 @@ app.get("/api/total-premium", async (req, res) => {
   const r = await pool.query(`SELECT COUNT(*)::int AS total FROM premium_users`);
   res.json({ ok: true, totalPremium: r.rows[0].total });
 });
+
