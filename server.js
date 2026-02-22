@@ -74,6 +74,40 @@ async function initDb() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS users_nick_idx ON users(nick);`);
+    /* =========================
+     CHAT (7 dias, 1 ativo por usuário)
+  ========================= */
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chats(
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at BIGINT NOT NULL,
+      expires_at BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS chats_user_idx ON chats(user_id);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS chats_expires_idx ON chats(expires_at);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chat_messages(
+      id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      sender TEXT NOT NULL, -- 'user' | 'admin'
+      message TEXT NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS chat_messages_chat_idx ON chat_messages(chat_id, created_at);
+  `);
 
   // GAMES
   await pool.query(`
@@ -421,5 +455,206 @@ app.get("/api/total-premium", async (req, res) => {
   } catch (e) {
     console.error("TOTAL_PREMIUM_FAIL:", e);
     res.status(500).json({ ok: false, error: "TOTAL_PREMIUM_FAIL" });
+  }
+});
+/* =========================
+   CHAT HELPERS
+========================= */
+
+const CHAT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 dias
+const CHAT_SPAM_MS = 30 * 1000; // 30s
+
+async function cleanupExpiredChats(){
+  const now = Date.now();
+  // apaga mensagens dos chats expirados
+  await pool.query(`
+    DELETE FROM chat_messages
+    WHERE chat_id IN (SELECT id FROM chats WHERE expires_at < $1)
+  `, [now]);
+
+  // apaga chats expirados
+  await pool.query(`DELETE FROM chats WHERE expires_at < $1`, [now]);
+}
+
+async function getOrCreateActiveChat(userId){
+  const now = Date.now();
+
+  // limpa expirados (leve e garante banco pequeno)
+  await cleanupExpiredChats();
+
+  // tenta pegar chat ativo
+  const r = await pool.query(
+    `SELECT * FROM chats WHERE user_id=$1 AND expires_at >= $2 LIMIT 1`,
+    [userId, now]
+  );
+  if(r.rowCount > 0) return r.rows[0];
+
+  // cria novo chat
+  const chatId = "c_" + Math.random().toString(36).slice(2, 10);
+  const createdAt = now;
+  const expiresAt = now + CHAT_TTL_MS;
+
+  await pool.query(
+    `INSERT INTO chats(id,user_id,created_at,expires_at) VALUES($1,$2,$3,$4)`,
+    [chatId, userId, createdAt, expiresAt]
+  );
+
+  return { id: chatId, user_id: userId, created_at: createdAt, expires_at: expiresAt };
+}
+
+/* =========================
+   CHAT (USER)
+========================= */
+
+// Enviar mensagem (logado)
+app.post("/api/chat/send", auth, async (req, res) => {
+  try{
+    const text = (req.body?.message || "").toString().trim();
+    if(!text) return res.status(400).json({ ok:false, error:"EMPTY" });
+    if(text.length > 500) return res.status(400).json({ ok:false, error:"TOO_LONG" });
+
+    const userId = req.user.id;
+    const chat = await getOrCreateActiveChat(userId);
+    const now = Date.now();
+
+    // anti-spam: 1 msg a cada 30s (somente do usuário)
+    const last = await pool.query(
+      `SELECT created_at FROM chat_messages
+       WHERE chat_id=$1 AND sender='user'
+       ORDER BY created_at DESC LIMIT 1`,
+      [chat.id]
+    );
+
+    if(last.rowCount > 0){
+      const lastAt = Number(last.rows[0].created_at || 0);
+      const left = (lastAt + CHAT_SPAM_MS) - now;
+      if(left > 0){
+        return res.status(429).json({ ok:false, error:"SPAM", waitMs:left });
+      }
+    }
+
+    const msgId = "m_" + Math.random().toString(36).slice(2, 10);
+    await pool.query(
+      `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
+       VALUES($1,$2,'user',$3,$4)`,
+      [msgId, chat.id, text, now]
+    );
+
+    res.json({ ok:true, chatId: chat.id, expiresAt: Number(chat.expires_at) });
+  }catch(e){
+    console.error("CHAT_SEND_FAIL:", e);
+    res.status(500).json({ ok:false, error:"CHAT_SEND_FAIL" });
+  }
+});
+
+// Ler mensagens (logado)
+app.get("/api/chat/messages", auth, async (req, res) => {
+  try{
+    const userId = req.user.id;
+    const chat = await getOrCreateActiveChat(userId); // se expirou, cria novo vazio
+    const now = Date.now();
+
+    // se acabou de criar, pode não ter mensagens ainda
+    const msgs = await pool.query(
+      `SELECT sender,message,created_at
+       FROM chat_messages
+       WHERE chat_id=$1
+       ORDER BY created_at ASC
+       LIMIT 200`,
+      [chat.id]
+    );
+
+    res.json({
+      ok:true,
+      chatId: chat.id,
+      expiresAt: Number(chat.expires_at),
+      messages: msgs.rows
+    });
+  }catch(e){
+    console.error("CHAT_MESSAGES_FAIL:", e);
+    res.status(500).json({ ok:false, error:"CHAT_MESSAGES_FAIL" });
+  }
+});
+
+/* =========================
+   CHAT (ADMIN)
+========================= */
+
+// Lista chats ativos (admin)
+app.get("/api/admin/chats", requireAdmin, async (req, res) => {
+  try{
+    await cleanupExpiredChats();
+    const now = Date.now();
+
+    const r = await pool.query(
+      `SELECT c.id, c.user_id, c.created_at, c.expires_at,
+              u.nick,
+              (SELECT created_at FROM chat_messages WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1) AS last_message_at
+       FROM chats c
+       LEFT JOIN users u ON u.id = c.user_id
+       WHERE c.expires_at >= $1
+       ORDER BY COALESCE((SELECT created_at FROM chat_messages WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1), c.created_at) DESC
+       LIMIT 100`,
+      [now]
+    );
+
+    res.json({ ok:true, chats: r.rows });
+  }catch(e){
+    console.error("ADMIN_CHATS_FAIL:", e);
+    res.status(500).json({ ok:false, error:"ADMIN_CHATS_FAIL" });
+  }
+});
+
+// Ler mensagens de um chat (admin)
+app.get("/api/admin/chats/:chatId/messages", requireAdmin, async (req, res) => {
+  try{
+    await cleanupExpiredChats();
+    const chatId = (req.params.chatId || "").toString().trim();
+    if(!chatId) return res.status(400).json({ ok:false, error:"NO_CHATID" });
+
+    const msgs = await pool.query(
+      `SELECT sender,message,created_at
+       FROM chat_messages
+       WHERE chat_id=$1
+       ORDER BY created_at ASC
+       LIMIT 300`,
+      [chatId]
+    );
+
+    res.json({ ok:true, chatId, messages: msgs.rows });
+  }catch(e){
+    console.error("ADMIN_CHAT_MESSAGES_FAIL:", e);
+    res.status(500).json({ ok:false, error:"ADMIN_CHAT_MESSAGES_FAIL" });
+  }
+});
+
+// Admin responder
+app.post("/api/admin/chats/:chatId/send", requireAdmin, async (req, res) => {
+  try{
+    await cleanupExpiredChats();
+    const chatId = (req.params.chatId || "").toString().trim();
+    const text = (req.body?.message || "").toString().trim();
+    if(!chatId) return res.status(400).json({ ok:false, error:"NO_CHATID" });
+    if(!text) return res.status(400).json({ ok:false, error:"EMPTY" });
+    if(text.length > 500) return res.status(400).json({ ok:false, error:"TOO_LONG" });
+
+    // garante que chat existe e não expirou
+    const c = await pool.query(`SELECT id, expires_at FROM chats WHERE id=$1 LIMIT 1`, [chatId]);
+    if(c.rowCount === 0) return res.status(404).json({ ok:false, error:"CHAT_NOT_FOUND" });
+
+    const now = Date.now();
+    if(now > Number(c.rows[0].expires_at || 0)) return res.status(410).json({ ok:false, error:"CHAT_EXPIRED" });
+
+    const msgId = "m_" + Math.random().toString(36).slice(2, 10);
+    await pool.query(
+      `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
+       VALUES($1,$2,'admin',$3,$4)`,
+      [msgId, chatId, text, now]
+    );
+
+    res.json({ ok:true });
+  }catch(e){
+    console.error("ADMIN_CHAT_SEND_FAIL:", e);
+    res.status(500).json({ ok:false, error:"ADMIN_CHAT_SEND_FAIL" });
   }
 });
