@@ -12,7 +12,12 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 app.use(express.json());
-app.use(cors({ origin: "*" }));
+app.use(cors({
+  origin: "*",
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-admin-key"],
+}));
+app.options("*", cors());
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "CHANGE_ME";
@@ -671,3 +676,4 @@ app.post(
     res.json({ ok: true });
   }
 );
+
