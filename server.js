@@ -1,9 +1,7 @@
-// server.js — ToolFlix API (Render + Postgres) — COMPLETO
-// ✅ Games + Tokens + Premium
-// ✅ Login (nick+senha) + JWT 30 dias
-// ✅ XP sincronizado via /api/add-xp
-// ✅ CHAT 7 dias
-// ✅ MASTER ACCOUNT (Srgokucheats pode ver chats sem admin key)
+// server.js — ToolFlix API (Render + Postgres)
+// 🔥 SUPER ADMIN TOTAL (Srgokucheats)
+// 🔐 Admin normal via ADMIN_KEY
+// 👑 Srgokucheats tem TODOS poderes sem ADMIN_KEY
 
 const express = require("express");
 const cors = require("cors");
@@ -20,7 +18,7 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "CHANGE_ME";
 const JWT_SECRET = process.env.JWT_SECRET || "TOOLFLIX_SECRET_123";
 
-// 👑 MASTER USER
+// 👑 SUPER ADMIN FIXO
 const MASTER_NICK = "Srgokucheats";
 
 const pool = new Pool({
@@ -32,18 +30,13 @@ const pool = new Pool({
    MIDDLEWARES
 ========================= */
 
-function requireAdmin(req, res, next) {
-  const key = req.headers["x-admin-key"];
-  if (!key || key !== ADMIN_KEY) {
-    return res.status(401).json({ ok: false, error: "ADMIN_UNAUTHORIZED" });
-  }
-  next();
-}
-
+// Auth normal (JWT obrigatório)
 function auth(req, res, next) {
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-  if (!token) return res.status(401).json({ ok: false, error: "NO_TOKEN" });
+
+  if (!token)
+    return res.status(401).json({ ok: false, error: "NO_TOKEN" });
 
   try {
     req.user = jwt.verify(token, JWT_SECRET);
@@ -53,12 +46,30 @@ function auth(req, res, next) {
   }
 }
 
-// 👑 MASTER (somente Srgokucheats)
-function requireMaster(req, res, next) {
-  if (!req.user || req.user.nick !== MASTER_NICK) {
-    return res.status(403).json({ ok: false, error: "MASTER_ONLY" });
-  }
+// 🔥 Auth opcional (para permitir ADMIN_KEY ou JWT)
+function authOptional(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+
+  if (!token) return next();
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+  } catch {}
   next();
+}
+
+// 🔐 ADMIN OU SUPER ADMIN
+function requireAdminOrMaster(req, res, next) {
+
+  // 1️⃣ Admin normal via key
+  const key = req.headers["x-admin-key"];
+  if (key && key === ADMIN_KEY) return next();
+
+  // 2️⃣ Super Admin via JWT
+  if (req.user && req.user.nick === MASTER_NICK) return next();
+
+  return res.status(403).json({ ok: false, error: "ADMIN_OR_MASTER_REQUIRED" });
 }
 
 /* =========================
@@ -102,7 +113,7 @@ async function initDb() {
   await pool.query(`CREATE INDEX IF NOT EXISTS users_nick_idx ON users(nick);`);
 
   /* =========================
-     CHAT (7 dias)
+     CHAT
   ========================= */
 
   await pool.query(`
@@ -274,7 +285,7 @@ app.post("/api/login", async (req, res) => {
   }
 });
 /* =========================
-   XP + USER
+   USER + XP
 ========================= */
 
 app.get("/api/me", auth, async (req, res) => {
@@ -309,7 +320,209 @@ app.post("/api/add-xp", auth, async (req, res) => {
 });
 
 /* =========================
-   CHAT HELPERS
+   GAMES
+========================= */
+
+app.get("/api/games", async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT * FROM games ORDER BY created_at DESC`
+    );
+    res.json({ ok: true, games: r.rows });
+  } catch (e) {
+    console.error("GAMES_GET_FAIL:", e);
+    res.status(500).json({ ok: false, error: "GAMES_GET_FAIL" });
+  }
+});
+
+/* 🔥 ADMIN ROUTES (AGORA SUPER ADMIN TOTAL) */
+
+// Limpar jogos
+app.post(
+  "/api/admin/clear-games",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      await pool.query(`DELETE FROM games`);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("CLEAR_GAMES_FAIL:", e);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
+
+// Criar ou atualizar jogo
+app.post(
+  "/api/admin/games",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      const title = (body.title || "").toString().trim();
+      const link = (body.link || "").toString().trim();
+      const image = (body.image || "").toString().trim();
+      const category = (body.category || "").toString().trim();
+      const premium = !!body.premium;
+
+      if (!title || !link)
+        return res.status(400).json({
+          ok: false,
+          error: "title e link obrigatórios"
+        });
+
+      const id = "g_" + Math.random().toString(36).slice(2, 10);
+
+      await pool.query(
+        `
+        INSERT INTO games(id,title,link,image,category,premium,created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (link) DO UPDATE
+        SET title = EXCLUDED.title,
+            image = EXCLUDED.image,
+            category = EXCLUDED.category,
+            premium = EXCLUDED.premium
+        `,
+        [id, title, link, image, category, premium, Date.now()]
+      );
+
+      res.json({ ok: true });
+
+    } catch (e) {
+      console.error("ADMIN_GAMES_FAIL:", e);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
+
+// Deletar jogo
+app.post(
+  "/api/admin/games/delete",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const { link } = req.body || {};
+      if (!link)
+        return res.status(400).json({
+          ok: false,
+          error: "link obrigatório"
+        });
+
+      await pool.query(
+        `DELETE FROM games WHERE link=$1`,
+        [String(link).trim()]
+      );
+
+      res.json({ ok: true });
+
+    } catch (e) {
+      console.error("DELETE_GAME_FAIL:", e);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
+/* =========================
+   TOKENS + PREMIUM
+========================= */
+
+app.post(
+  "/api/admin/tokens",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const { days = 30 } = req.body || {};
+      const now = Date.now();
+      const expiresAt = now + Number(days) * 24 * 60 * 60 * 1000;
+
+      const token =
+        "TFX-" +
+        Math.random().toString(36).toUpperCase().slice(2, 8) +
+        "-" +
+        Math.random().toString(36).toUpperCase().slice(2, 8);
+
+      await pool.query(
+        `INSERT INTO tokens(token,created_at,expires_at,used_by,used_at)
+         VALUES($1,$2,$3,NULL,NULL)`,
+        [token, now, expiresAt]
+      );
+
+      res.json({ ok: true, token, expiresAt });
+
+    } catch (e) {
+      console.error("TOKEN_CREATE_FAIL:", e);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
+
+app.post("/api/validar-token", async (req, res) => {
+  try {
+    const token = (req.body?.token || "").toString().trim().toUpperCase();
+    const userId = (req.body?.userId || "").toString().trim();
+
+    if (!token || !userId)
+      return res.status(400).json({ ok: false });
+
+    const r = await pool.query(
+      `SELECT * FROM tokens WHERE token=$1`,
+      [token]
+    );
+
+    if (r.rowCount === 0)
+      return res.json({ ok: false, reason: "TOKEN_INEXISTENTE" });
+
+    const t = r.rows[0];
+    const now = Date.now();
+
+    if (now > Number(t.expires_at))
+      return res.json({ ok: false, reason: "TOKEN_EXPIRADO" });
+
+    if (t.used_by && t.used_by !== userId)
+      return res.json({ ok: false, reason: "TOKEN_JA_USADO" });
+
+    await pool.query(
+      `UPDATE tokens SET used_by=$1, used_at=$2 WHERE token=$3`,
+      [userId, now, token]
+    );
+
+    await pool.query(
+      `INSERT INTO premium_users(user_id,since)
+       VALUES($1,$2)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [userId, now]
+    );
+
+    res.json({ ok: true, valid: true });
+
+  } catch (e) {
+    console.error("VALIDAR_TOKEN_FAIL:", e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+app.get("/api/is-premium/:userId", async (req, res) => {
+  const r = await pool.query(
+    `SELECT user_id FROM premium_users WHERE user_id=$1 LIMIT 1`,
+    [req.params.userId]
+  );
+
+  res.json({ ok: true, premium: r.rowCount > 0 });
+});
+
+app.get("/api/total-premium", async (req, res) => {
+  const r = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM premium_users`
+  );
+
+  res.json({ ok: true, totalPremium: r.rows[0].total });
+});
+
+/* =========================
+   CHAT SYSTEM
 ========================= */
 
 const CHAT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -320,9 +533,7 @@ async function cleanupExpiredChats() {
 
   await pool.query(`
     DELETE FROM chat_messages
-    WHERE chat_id IN (
-      SELECT id FROM chats WHERE expires_at < $1
-    )
+    WHERE chat_id IN (SELECT id FROM chats WHERE expires_at < $1)
   `, [now]);
 
   await pool.query(
@@ -337,16 +548,13 @@ async function getOrCreateActiveChat(userId) {
   await cleanupExpiredChats();
 
   const r = await pool.query(
-    `SELECT * FROM chats 
-     WHERE user_id=$1 AND expires_at >= $2 
-     LIMIT 1`,
+    `SELECT * FROM chats WHERE user_id=$1 AND expires_at >= $2 LIMIT 1`,
     [userId, now]
   );
 
   if (r.rowCount > 0) return r.rows[0];
 
   const chatId = "c_" + Math.random().toString(36).slice(2, 10);
-
   const expiresAt = now + CHAT_TTL_MS;
 
   await pool.query(
@@ -355,344 +563,111 @@ async function getOrCreateActiveChat(userId) {
     [chatId, userId, now, expiresAt]
   );
 
-  return {
-    id: chatId,
-    user_id: userId,
-    created_at: now,
-    expires_at: expiresAt,
-  };
+  return { id: chatId, expires_at: expiresAt };
 }
 
-/* =========================
-   CHAT (USER)
-========================= */
+/* USER SEND */
 
 app.post("/api/chat/send", auth, async (req, res) => {
-  try {
-    const text = (req.body?.message || "").toString().trim();
-    if (!text)
-      return res.status(400).json({ ok: false, error: "EMPTY" });
+  const text = (req.body?.message || "").toString().trim();
+  if (!text) return res.status(400).json({ ok: false });
 
-    if (text.length > 500)
-      return res.status(400).json({ ok: false, error: "TOO_LONG" });
+  const chat = await getOrCreateActiveChat(req.user.id);
+  const now = Date.now();
 
-    const userId = req.user.id;
-    const chat = await getOrCreateActiveChat(userId);
-    const now = Date.now();
+  const last = await pool.query(
+    `SELECT created_at FROM chat_messages
+     WHERE chat_id=$1 AND sender='user'
+     ORDER BY created_at DESC LIMIT 1`,
+    [chat.id]
+  );
 
-    const last = await pool.query(
-      `SELECT created_at FROM chat_messages
-       WHERE chat_id=$1 AND sender='user'
-       ORDER BY created_at DESC LIMIT 1`,
-      [chat.id]
+  if (last.rowCount > 0) {
+    const lastAt = Number(last.rows[0].created_at);
+    if (now - lastAt < CHAT_SPAM_MS)
+      return res.status(429).json({ ok: false, error: "SPAM" });
+  }
+
+  const msgId = "m_" + Math.random().toString(36).slice(2, 10);
+
+  await pool.query(
+    `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
+     VALUES($1,$2,'user',$3,$4)`,
+    [msgId, chat.id, text, now]
+  );
+
+  res.json({ ok: true });
+});
+
+/* USER READ */
+
+app.get("/api/chat/messages", auth, async (req, res) => {
+  const chat = await getOrCreateActiveChat(req.user.id);
+
+  const msgs = await pool.query(
+    `SELECT sender,message,created_at
+     FROM chat_messages
+     WHERE chat_id=$1
+     ORDER BY created_at ASC`,
+    [chat.id]
+  );
+
+  res.json({ ok: true, messages: msgs.rows });
+});
+
+/* 🔥 SUPER ADMIN VÊ TODOS CHATS (mesma rota admin) */
+
+app.get(
+  "/api/admin/chats",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    await cleanupExpiredChats();
+
+    const r = await pool.query(`
+      SELECT c.id, c.user_id, u.nick, c.created_at, c.expires_at
+      FROM chats c
+      LEFT JOIN users u ON u.id = c.user_id
+      ORDER BY c.created_at DESC
+    `);
+
+    res.json({ ok: true, chats: r.rows });
+  }
+);
+
+app.get(
+  "/api/admin/chats/:chatId/messages",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    const msgs = await pool.query(
+      `SELECT sender,message,created_at
+       FROM chat_messages
+       WHERE chat_id=$1
+       ORDER BY created_at ASC`,
+      [req.params.chatId]
     );
 
-    if (last.rowCount > 0) {
-      const lastAt = Number(last.rows[0].created_at || 0);
-      const left = (lastAt + CHAT_SPAM_MS) - now;
+    res.json({ ok: true, messages: msgs.rows });
+  }
+);
 
-      if (left > 0) {
-        return res.status(429).json({
-          ok: false,
-          error: "SPAM",
-          waitMs: left,
-        });
-      }
-    }
+app.post(
+  "/api/admin/chats/:chatId/send",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    const text = (req.body?.message || "").toString().trim();
+    if (!text) return res.status(400).json({ ok: false });
 
     const msgId = "m_" + Math.random().toString(36).slice(2, 10);
 
     await pool.query(
       `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
-       VALUES($1,$2,'user',$3,$4)`,
-      [msgId, chat.id, text, now]
+       VALUES($1,$2,'admin',$3,$4)`,
+      [msgId, req.params.chatId, text, Date.now()]
     );
 
-    res.json({
-      ok: true,
-      chatId: chat.id,
-      expiresAt: Number(chat.expires_at),
-    });
-
-  } catch (e) {
-    console.error("CHAT_SEND_FAIL:", e);
-    res.status(500).json({ ok: false, error: "CHAT_SEND_FAIL" });
-  }
-});
-
-app.get("/api/chat/messages", auth, async (req, res) => {
-  try {
-    const chat = await getOrCreateActiveChat(req.user.id);
-
-    const msgs = await pool.query(
-      `SELECT sender,message,created_at
-       FROM chat_messages
-       WHERE chat_id=$1
-       ORDER BY created_at ASC
-       LIMIT 200`,
-      [chat.id]
-    );
-
-    res.json({
-      ok: true,
-      chatId: chat.id,
-      expiresAt: Number(chat.expires_at),
-      messages: msgs.rows,
-    });
-
-  } catch (e) {
-    console.error("CHAT_MESSAGES_FAIL:", e);
-    res.status(500).json({ ok: false, error: "CHAT_MESSAGES_FAIL" });
-  }
-});
-
-/* =========================
-   👑 MASTER CHAT ROUTES
-   (SOMENTE Srgokucheats)
-========================= */
-
-// Lista todos chats ativos (MASTER)
-app.get("/api/master/chats", auth, requireMaster, async (req, res) => {
-  try {
-    await cleanupExpiredChats();
-    const now = Date.now();
-
-    const r = await pool.query(
-      `SELECT c.id, c.user_id, c.created_at, c.expires_at,
-              u.nick
-       FROM chats c
-       LEFT JOIN users u ON u.id = c.user_id
-       WHERE c.expires_at >= $1
-       ORDER BY c.created_at DESC`,
-      [now]
-    );
-
-    res.json({ ok: true, chats: r.rows });
-
-  } catch (e) {
-    console.error("MASTER_CHATS_FAIL:", e);
-    res.status(500).json({ ok: false, error: "MASTER_CHATS_FAIL" });
-  }
-});
-
-// Ler mensagens de qualquer chat (MASTER)
-app.get("/api/master/chats/:chatId/messages",
-  auth,
-  requireMaster,
-  async (req, res) => {
-    try {
-      const chatId = (req.params.chatId || "").toString().trim();
-
-      const msgs = await pool.query(
-        `SELECT sender,message,created_at
-         FROM chat_messages
-         WHERE chat_id=$1
-         ORDER BY created_at ASC
-         LIMIT 300`,
-        [chatId]
-      );
-
-      res.json({ ok: true, messages: msgs.rows });
-
-    } catch (e) {
-      console.error("MASTER_CHAT_MESSAGES_FAIL:", e);
-      res.status(500).json({ ok: false, error: "MASTER_CHAT_MESSAGES_FAIL" });
-    }
+    res.json({ ok: true });
   }
 );
-/* =========================
-   👑 MASTER RESPONDER CHAT
-========================= */
-
-app.post(
-  "/api/master/chats/:chatId/send",
-  auth,
-  requireMaster,
-  async (req, res) => {
-    try {
-      await cleanupExpiredChats();
-
-      const chatId = (req.params.chatId || "").toString().trim();
-      const text = (req.body?.message || "").toString().trim();
-
-      if (!chatId)
-        return res.status(400).json({ ok: false, error: "NO_CHATID" });
-
-      if (!text)
-        return res.status(400).json({ ok: false, error: "EMPTY" });
-
-      if (text.length > 500)
-        return res.status(400).json({ ok: false, error: "TOO_LONG" });
-
-      const c = await pool.query(
-        `SELECT id, expires_at FROM chats WHERE id=$1 LIMIT 1`,
-        [chatId]
-      );
-
-      if (c.rowCount === 0)
-        return res.status(404).json({ ok: false, error: "CHAT_NOT_FOUND" });
-
-      const now = Date.now();
-
-      if (now > Number(c.rows[0].expires_at || 0))
-        return res.status(410).json({ ok: false, error: "CHAT_EXPIRED" });
-
-      const msgId = "m_" + Math.random().toString(36).slice(2, 10);
-
-      await pool.query(
-        `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
-         VALUES($1,$2,'admin',$3,$4)`,
-        [msgId, chatId, text, now]
-      );
-
-      res.json({ ok: true });
-
-    } catch (e) {
-      console.error("MASTER_CHAT_SEND_FAIL:", e);
-      res.status(500).json({ ok: false, error: "MASTER_CHAT_SEND_FAIL" });
-    }
-  }
-);
-
-/* =========================
-   TOKENS + PREMIUM
-========================= */
-
-app.post("/api/admin/tokens", requireAdmin, async (req, res) => {
-  try {
-    const { days = 30 } = req.body || {};
-    const now = Date.now();
-    const expiresAt = now + Number(days) * 24 * 60 * 60 * 1000;
-
-    const token =
-      "TFX-" +
-      Math.random().toString(36).toUpperCase().slice(2, 8) +
-      "-" +
-      Math.random().toString(36).toUpperCase().slice(2, 8);
-
-    await pool.query(
-      `INSERT INTO tokens(token,created_at,expires_at,used_by,used_at)
-       VALUES($1,$2,$3,NULL,NULL)`,
-      [token, now, expiresAt]
-    );
-
-    res.json({
-      ok: true,
-      token: { token, createdAt: now, expiresAt },
-    });
-
-  } catch (e) {
-    console.error("ADMIN_TOKEN_CREATE_FAIL:", e);
-    res.status(500).json({ ok: false, error: "ADMIN_TOKEN_CREATE_FAIL" });
-  }
-});
-
-app.post("/api/validar-token", async (req, res) => {
-  try {
-    const token = (req.body?.token || "").toString().trim().toUpperCase();
-    const userId = (req.body?.userId || "").toString().trim();
-
-    if (!token || !userId)
-      return res.status(400).json({
-        ok: false,
-        error: "token e userId obrigatórios",
-      });
-
-    const r = await pool.query(
-      `SELECT * FROM tokens WHERE token=$1`,
-      [token]
-    );
-
-    if (r.rowCount === 0)
-      return res.json({
-        ok: false,
-        valid: false,
-        reason: "TOKEN_INEXISTENTE",
-      });
-
-    const t = r.rows[0];
-    const now = Date.now();
-
-    if (now > Number(t.expires_at))
-      return res.json({
-        ok: false,
-        valid: false,
-        reason: "TOKEN_EXPIRADO",
-      });
-
-    if (t.used_by && t.used_by !== userId)
-      return res.json({
-        ok: false,
-        valid: false,
-        reason: "TOKEN_JA_USADO",
-      });
-
-    await pool.query(
-      `UPDATE tokens SET used_by=$1, used_at=$2 WHERE token=$3`,
-      [userId, now, token]
-    );
-
-    await pool.query(
-      `INSERT INTO premium_users(user_id, since)
-       VALUES($1,$2)
-       ON CONFLICT (user_id) DO NOTHING`,
-      [userId, now]
-    );
-
-    res.json({ ok: true, valid: true, userId });
-
-  } catch (e) {
-    console.error("VALIDAR_TOKEN_FAIL:", e);
-    res.status(500).json({ ok: false, error: "VALIDAR_TOKEN_FAIL" });
-  }
-});
-
-app.get("/api/is-premium/:userId", async (req, res) => {
-  try {
-    const userId = (req.params.userId || "").toString().trim();
-
-    if (!userId)
-      return res.status(400).json({
-        ok: false,
-        error: "userId obrigatório",
-      });
-
-    const r = await pool.query(
-      `SELECT user_id, since 
-       FROM premium_users 
-       WHERE user_id=$1 
-       LIMIT 1`,
-      [userId]
-    );
-
-    if (r.rowCount === 0)
-      return res.json({ ok: true, premium: false });
-
-    res.json({
-      ok: true,
-      premium: true,
-      since: Number(r.rows[0].since || 0),
-    });
-
-  } catch (e) {
-    console.error("IS_PREMIUM_FAIL:", e);
-    res.status(500).json({ ok: false, error: "IS_PREMIUM_FAIL" });
-  }
-});
-
-app.get("/api/total-premium", async (req, res) => {
-  try {
-    const r = await pool.query(
-      `SELECT COUNT(*)::int AS total FROM premium_users`
-    );
-
-    res.json({
-      ok: true,
-      totalPremium: r.rows[0].total,
-    });
-
-  } catch (e) {
-    console.error("TOTAL_PREMIUM_FAIL:", e);
-    res.status(500).json({ ok: false, error: "TOTAL_PREMIUM_FAIL" });
-  }
-});
