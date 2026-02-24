@@ -11,6 +11,26 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const app = express();
+const corsOptions = {
+  origin: "*",
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Admin-Key", "x-admin-key"],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// Backup “na marra” (evita render/proxy comer header)
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-admin-key, X-Admin-Key");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+app.use(express.json());
 app.use(express.json());
 app.use(cors({
   origin: "*",
@@ -676,4 +696,5 @@ app.post(
     res.json({ ok: true });
   }
 );
+
 
