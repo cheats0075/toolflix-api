@@ -214,6 +214,24 @@ async function initDb() {
       since BIGINT NOT NULL
     );
   `);
+  /* =========================
+     VISITAS (CONTADOR GLOBAL)
+  ========================= */
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS site_stats(
+      key TEXT PRIMARY KEY,
+      value BIGINT NOT NULL
+    );
+  `);
+
+  // garante a chave "visits"
+  await pool.query(`
+    INSERT INTO site_stats(key, value)
+    VALUES('visits', 0)
+    ON CONFLICT (key) DO NOTHING;
+  `);
+
 }
 
 initDb()
@@ -545,6 +563,46 @@ app.get("/api/total-premium", async (req, res) => {
 
   res.json({ ok: true, totalPremium: r.rows[0].total });
 });
+
+/* =========================
+   VISITAS (CONTADOR REAL)
+========================= */
+
+// Incrementa 1 visita por sessão (o front já evita duplicar).
+// Retorna { ok:true, count: <total> }
+app.post("/api/visits", async (req, res) => {
+  try {
+    const r = await pool.query(`
+      INSERT INTO site_stats(key, value)
+      VALUES('visits', 1)
+      ON CONFLICT (key) DO UPDATE
+      SET value = site_stats.value + 1
+      RETURNING value::bigint AS count
+    `);
+
+    const count = Number(r.rows[0]?.count || 0);
+    res.json({ ok: true, count });
+  } catch (e) {
+    console.error("VISITS_POST_FAIL:", e);
+    res.status(500).json({ ok: false, error: "VISITS_POST_FAIL" });
+  }
+});
+
+// Apenas consulta o total
+app.get("/api/visits", async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT value::bigint AS count FROM site_stats WHERE key='visits' LIMIT 1`
+    );
+    const count = Number(r.rows[0]?.count || 0);
+    res.json({ ok: true, count });
+  } catch (e) {
+    console.error("VISITS_GET_FAIL:", e);
+    res.status(500).json({ ok: false, error: "VISITS_GET_FAIL" });
+  }
+});
+
+
 
 /* =========================
    CHAT SYSTEM
