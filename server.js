@@ -149,6 +149,22 @@ async function initDb() {
       expires_at BIGINT NOT NULL
     );
   `);
+  // 🔥 garante coluna de última atividade (para ordenar chats como WhatsApp)
+  await pool.query(`
+    ALTER TABLE chats
+    ADD COLUMN IF NOT EXISTS last_activity_at BIGINT NOT NULL DEFAULT 0;
+  `);
+
+  // backfill: se estiver 0, usa created_at ou última mensagem
+  await pool.query(`
+    UPDATE chats c
+    SET last_activity_at = COALESCE(
+      (SELECT MAX(created_at) FROM chat_messages m WHERE m.chat_id = c.id),
+      c.created_at
+    )
+    WHERE c.last_activity_at = 0
+  `);
+
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS chats_user_idx ON chats(user_id);
@@ -641,9 +657,9 @@ async function getOrCreateActiveChat(userId) {
   const expiresAt = now + CHAT_TTL_MS;
 
   await pool.query(
-    `INSERT INTO chats(id,user_id,created_at,expires_at)
-     VALUES($1,$2,$3,$4)`,
-    [chatId, userId, now, expiresAt]
+    `INSERT INTO chats(id,user_id,created_at,expires_at,last_activity_at)
+     VALUES($1,$2,$3,$4,$5)`,
+    [chatId, userId, now, expiresAt, now]
   );
 
   return { id: chatId, expires_at: expiresAt };
@@ -679,6 +695,9 @@ app.post("/api/chat/send", auth, async (req, res) => {
     [msgId, chat.id, text, now]
   );
 
+  // atualiza última atividade do chat
+  await pool.query(`UPDATE chats SET last_activity_at=$1 WHERE id=$2`, [now, chat.id]);
+
   res.json({ ok: true });
 });
 
@@ -708,10 +727,10 @@ app.get(
     await cleanupExpiredChats();
 
     const r = await pool.query(`
-      SELECT c.id, c.user_id, u.nick, c.created_at, c.expires_at
+      SELECT c.id, c.user_id, u.nick, c.created_at, c.expires_at, c.last_activity_at
       FROM chats c
       LEFT JOIN users u ON u.id = c.user_id
-      ORDER BY c.created_at DESC
+      ORDER BY c.last_activity_at DESC, c.created_at DESC
     `);
 
     res.json({ ok: true, chats: r.rows });
@@ -750,6 +769,9 @@ app.post(
        VALUES($1,$2,'admin',$3,$4)`,
       [msgId, req.params.chatId, text, Date.now()]
     );
+
+    // atualiza última atividade do chat
+    await pool.query(`UPDATE chats SET last_activity_at=$1 WHERE id=$2`, [Date.now(), req.params.chatId]);
 
     res.json({ ok: true });
   }
