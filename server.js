@@ -268,6 +268,15 @@ app.get("/", (req, res) =>
   res.json({ ok: true, name: "ToolFlix API" })
 );
 
+app.get("/ping", (req, res) => {
+  res.status(200).send("ok");
+});
+
+// UptimeRobot e alguns proxies usam HEAD. Vamos responder bonito.
+app.head("/ping", (req, res) => res.sendStatus(200));
+app.head("/", (req, res) => res.sendStatus(200));
+
+
 /* =========================
    AUTH (REGISTER / LOGIN)
 ========================= */
