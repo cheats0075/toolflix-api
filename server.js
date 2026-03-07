@@ -722,11 +722,13 @@ app.get("/api/visitors", async (req, res) => {
       [onlineMin]
     );
 
-    const lastR = await pool.query(
+    const lastSeenR = await pool.query(
       `SELECT nick, xp, is_guest, last_seen_at
        FROM site_visitors
+       WHERE last_seen_at < $1
        ORDER BY last_seen_at DESC
-       LIMIT 10`
+       LIMIT 10`,
+      [onlineMin]
     );
 
     res.json({
@@ -738,7 +740,7 @@ app.get("/api/visitors", async (req, res) => {
         is_guest: !!r.is_guest,
         last_seen_at: Number(r.last_seen_at || 0),
       })),
-      last: lastR.rows.map(r => ({
+      lastSeen: lastSeenR.rows.map(r => ({
         nick: r.nick,
         xp: Number(r.xp || 0),
         is_guest: !!r.is_guest,
