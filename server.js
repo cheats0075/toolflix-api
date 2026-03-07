@@ -293,6 +293,34 @@ async function initDb() {
     ON site_visitors(last_seen_at DESC);
   `);
 
+  /* =========================
+     GLOBAL CHAT
+  ========================= */
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS global_chat(
+      id TEXT PRIMARY KEY,
+      sender_key TEXT NOT NULL,
+      user_id TEXT,
+      nick TEXT NOT NULL,
+      xp BIGINT DEFAULT 0,
+      level BIGINT DEFAULT 1,
+      is_guest BOOLEAN DEFAULT true,
+      message TEXT NOT NULL,
+      created_at BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS global_chat_created_idx
+    ON global_chat(created_at ASC);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS global_chat_sender_idx
+    ON global_chat(sender_key, created_at DESC);
+  `);
+
 }
 
 initDb()
@@ -755,11 +783,115 @@ app.get("/api/visitors", async (req, res) => {
 
 
 /* =========================
+   GLOBAL CHAT
+========================= */
+
+app.get('/api/global-chat/messages', async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT nick, xp, level, is_guest, message, created_at
+      FROM global_chat
+      ORDER BY created_at ASC
+      LIMIT 100
+    `);
+
+    res.json({
+      ok: true,
+      messages: r.rows.map(m => ({
+        nick: m.nick,
+        xp: Number(m.xp || 0),
+        level: Number(m.level || 1),
+        is_guest: !!m.is_guest,
+        message: m.message,
+        created_at: Number(m.created_at || 0)
+      }))
+    });
+  } catch (e) {
+    console.error('GLOBAL_CHAT_MESSAGES_FAIL:', e);
+    res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_MESSAGES_FAIL' });
+  }
+});
+
+app.post('/api/global-chat/send', authOptional, async (req, res) => {
+  try {
+    const text = (req.body?.message || '').toString().trim();
+    if (!text) return res.status(400).json({ ok: false, error: 'MESSAGE_REQUIRED' });
+    if (text.length > GLOBAL_CHAT_MAX_LEN) {
+      return res.status(400).json({ ok: false, error: 'MESSAGE_TOO_LONG', max: GLOBAL_CHAT_MAX_LEN });
+    }
+
+    const now = Date.now();
+    const senderKey = getVisitorKey(req);
+
+    const last = await pool.query(
+      `SELECT created_at FROM global_chat WHERE sender_key=$1 ORDER BY created_at DESC LIMIT 1`,
+      [senderKey]
+    );
+    if (last.rowCount > 0) {
+      const lastAt = Number(last.rows[0].created_at || 0);
+      if (now - lastAt < GLOBAL_CHAT_SPAM_MS) {
+        return res.status(429).json({ ok: false, error: 'SPAM', waitMs: GLOBAL_CHAT_SPAM_MS - (now - lastAt) });
+      }
+    }
+
+    let nick = req.user?.nick || '';
+    let userId = req.user?.id || null;
+    let xp = 0;
+    let level = 1;
+    let isGuest = !userId;
+
+    if (userId) {
+      const ur = await pool.query(`SELECT nick, xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      nick = ur.rows[0]?.nick || nick || 'Usuário';
+      xp = Number(ur.rows[0]?.xp || 0);
+      if (xp < 100) level = 1;
+      else if (xp < 250) level = 2;
+      else if (xp < 500) level = 3;
+      else if (xp < 750) level = 4;
+      else if (xp < 1250) level = 5;
+      else {
+        level = 6;
+        let min = 1250, max = 1900;
+        while (xp >= max) {
+          level++;
+          min = max;
+          const delta = 650 + (level - 7) * 150;
+          max = min + delta;
+          if (level > 1000) break;
+        }
+      }
+    } else {
+      const raw = senderKey.replace(/^guest:/, '');
+      const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
+      nick = `Usuário ${suffix}`;
+      xp = 0;
+      level = 1;
+      isGuest = true;
+    }
+
+    const msgId = 'gc_' + Math.random().toString(36).slice(2, 10);
+    await pool.query(
+      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,is_guest,message,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [msgId, senderKey, userId, nick, xp, level, isGuest, text, now]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('GLOBAL_CHAT_SEND_FAIL:', e);
+    res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
+  }
+});
+
+
+/* =========================
    CHAT SYSTEM
 ========================= */
 
 const CHAT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHAT_SPAM_MS = 30 * 1000;
+const GLOBAL_CHAT_SPAM_MS = 3 * 1000;
+const GLOBAL_CHAT_MAX_LEN = 200;
 
 async function cleanupExpiredChats() {
   const now = Date.now();
