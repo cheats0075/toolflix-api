@@ -118,6 +118,24 @@ function fetchJson(url) {
       .on("error", reject);
   });
 }
+
+function getVisitorKey(req) {
+  const bodyKey = (req.body?.guestKey || "").toString().trim();
+  const queryKey = (req.query?.guestKey || "").toString().trim();
+
+  if (req.user?.id) return `user:${req.user.id}`;
+  if (bodyKey) return `guest:${bodyKey}`;
+  if (queryKey) return `guest:${queryKey}`;
+
+  const ip = (req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "guest")
+    .toString()
+    .split(",")[0]
+    .trim();
+
+  return `guest:${ip}`;
+}
+
+const ONLINE_WINDOW_MS = 2 * 60 * 1000;
 /* =========================
    INIT DATABASE
 ========================= */
@@ -246,6 +264,33 @@ async function initDb() {
     INSERT INTO site_stats(key, value)
     VALUES('visits', 0)
     ON CONFLICT (key) DO NOTHING;
+  `);
+
+  /* =========================
+     VISITANTES / ONLINE
+  ========================= */
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS site_visitors(
+      id BIGSERIAL PRIMARY KEY,
+      visitor_key TEXT NOT NULL,
+      user_id TEXT,
+      nick TEXT NOT NULL,
+      xp BIGINT DEFAULT 0,
+      is_guest BOOLEAN DEFAULT true,
+      first_seen_at BIGINT NOT NULL,
+      last_seen_at BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS site_visitors_visitor_key_unique
+    ON site_visitors(visitor_key);
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS site_visitors_last_seen_idx
+    ON site_visitors(last_seen_at DESC);
   `);
 
 }
@@ -627,6 +672,84 @@ app.get("/api/visits", async (req, res) => {
   }
 });
 
+/* =========================
+   VISITANTES / ONLINE
+========================= */
+
+app.post("/api/visitor", authOptional, async (req, res) => {
+  try {
+    const now = Date.now();
+    const visitorKey = getVisitorKey(req);
+    const nick = req.user?.nick || "Visitante";
+    const userId = req.user?.id || null;
+
+    let xp = 0;
+    if (userId) {
+      const ur = await pool.query(`SELECT xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      xp = Number(ur.rows[0]?.xp || 0);
+    }
+
+    await pool.query(
+      `INSERT INTO site_visitors(visitor_key,user_id,nick,xp,is_guest,first_seen_at,last_seen_at)
+       VALUES($1,$2,$3,$4,$5,$6,$6)
+       ON CONFLICT (visitor_key) DO UPDATE
+       SET user_id = EXCLUDED.user_id,
+           nick = EXCLUDED.nick,
+           xp = EXCLUDED.xp,
+           is_guest = EXCLUDED.is_guest,
+           last_seen_at = EXCLUDED.last_seen_at`,
+      [visitorKey, userId, nick, xp, !userId, now]
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("VISITOR_POST_FAIL:", e);
+    res.status(500).json({ ok: false, error: "VISITOR_POST_FAIL" });
+  }
+});
+
+app.get("/api/visitors", async (req, res) => {
+  try {
+    const now = Date.now();
+    const onlineMin = now - ONLINE_WINDOW_MS;
+
+    const onlineR = await pool.query(
+      `SELECT nick, xp, is_guest, last_seen_at
+       FROM site_visitors
+       WHERE last_seen_at >= $1
+       ORDER BY last_seen_at DESC
+       LIMIT 50`,
+      [onlineMin]
+    );
+
+    const lastR = await pool.query(
+      `SELECT nick, xp, is_guest, last_seen_at
+       FROM site_visitors
+       ORDER BY last_seen_at DESC
+       LIMIT 10`
+    );
+
+    res.json({
+      ok: true,
+      onlineCount: onlineR.rowCount,
+      online: onlineR.rows.map(r => ({
+        nick: r.nick,
+        xp: Number(r.xp || 0),
+        is_guest: !!r.is_guest,
+        last_seen_at: Number(r.last_seen_at || 0),
+      })),
+      last: lastR.rows.map(r => ({
+        nick: r.nick,
+        xp: Number(r.xp || 0),
+        is_guest: !!r.is_guest,
+        last_seen_at: Number(r.last_seen_at || 0),
+      })),
+    });
+  } catch (e) {
+    console.error("VISITORS_GET_FAIL:", e);
+    res.status(500).json({ ok: false, error: "VISITORS_GET_FAIL" });
+  }
+});
 
 
 /* =========================
