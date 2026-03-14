@@ -136,6 +136,26 @@ function getVisitorKey(req) {
 }
 
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
+
+async function cleanupExpiredPremiumAccounts() {
+  const now = Date.now();
+  await pool.query(`
+    UPDATE users
+    SET premium = false,
+        premium_removed_at = COALESCE(premium_removed_at, $1),
+        premium_removed_by = COALESCE(premium_removed_by, 'auto_expire')
+    WHERE premium = true
+      AND premium_until IS NOT NULL
+      AND premium_until <= $1
+  `, [now]);
+}
+
+function maskToken(token) {
+  const t = (token || '').toString().trim();
+  if (!t) return null;
+  if (t.length <= 8) return t;
+  return `${t.slice(0,4)}...${t.slice(-4)}`;
+}
 /* =========================
    INIT DATABASE
 ========================= */
@@ -154,6 +174,18 @@ async function initDb() {
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_nick_idx ON users(nick);`);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS premium BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS premium_since BIGINT,
+    ADD COLUMN IF NOT EXISTS premium_until BIGINT,
+    ADD COLUMN IF NOT EXISTS premium_token_used TEXT,
+    ADD COLUMN IF NOT EXISTS premium_removed_at BIGINT,
+    ADD COLUMN IF NOT EXISTS premium_removed_by TEXT;
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
 
   /* =========================
      CHAT
@@ -248,14 +280,6 @@ async function initDb() {
       since BIGINT NOT NULL
     );
   `);
-
-  await pool.query(`
-    ALTER TABLE premium_users
-    ADD COLUMN IF NOT EXISTS expires_at BIGINT,
-    ADD COLUMN IF NOT EXISTS token_used TEXT,
-    ADD COLUMN IF NOT EXISTS removed_at BIGINT,
-    ADD COLUMN IF NOT EXISTS removed_by TEXT;
-  `);
   /* =========================
      VISITAS (CONTADOR GLOBAL)
   ========================= */
@@ -317,13 +341,6 @@ async function initDb() {
       message TEXT NOT NULL,
       created_at BIGINT NOT NULL
     );
-  `);
-
-  await pool.query(`
-    ALTER TABLE global_chat
-    ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS deleted_by TEXT,
-    ADD COLUMN IF NOT EXISTS deleted_at BIGINT;
   `);
 
   await pool.query(`
@@ -616,37 +633,69 @@ app.post(
 );
 
 app.post("/api/validar-token", async (req, res) => {
+  const client = await pool.connect();
   try {
     const token = (req.body?.token || "").toString().trim().toUpperCase();
     const userId = (req.body?.userId || "").toString().trim();
 
-    if (!token || !userId)
-      return res.status(400).json({ ok: false });
+    if (!token || !userId) {
+      return res.status(400).json({ ok: false, reason: "TOKEN_OU_USUARIO_INVALIDO" });
+    }
 
-    const r = await pool.query(
-      `SELECT * FROM tokens WHERE token=$1`,
+    await client.query("BEGIN");
+
+    const userResult = await client.query(
+      `SELECT id, nick FROM users WHERE id=$1 LIMIT 1`,
+      [userId]
+    );
+
+    if (userResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.json({ ok: false, reason: "USUARIO_NAO_ENCONTRADO" });
+    }
+
+    const tokenResult = await client.query(
+      `SELECT * FROM tokens WHERE token=$1 LIMIT 1`,
       [token]
     );
 
-    if (r.rowCount === 0)
+    if (tokenResult.rowCount === 0) {
+      await client.query("ROLLBACK");
       return res.json({ ok: false, reason: "TOKEN_INEXISTENTE" });
+    }
 
-    const t = r.rows[0];
+    const t = tokenResult.rows[0];
     const now = Date.now();
 
-    if (now > Number(t.expires_at))
+    if (now > Number(t.expires_at)) {
+      await client.query("ROLLBACK");
       return res.json({ ok: false, reason: "TOKEN_EXPIRADO" });
+    }
 
-    if (t.used_by && t.used_by !== userId)
+    if (t.used_by) {
+      await client.query("ROLLBACK");
       return res.json({ ok: false, reason: "TOKEN_JA_USADO" });
+    }
 
-    await pool.query(
+    await client.query(
       `UPDATE tokens SET used_by=$1, used_at=$2 WHERE token=$3`,
       [userId, now, token]
     );
 
-    await pool.query(
-      `INSERT INTO premium_users(user_id,since,expires_at,token_used,removed_at,removed_by)
+    await client.query(
+      `UPDATE users
+       SET premium = true,
+           premium_since = $2,
+           premium_until = $3,
+           premium_token_used = $4,
+           premium_removed_at = NULL,
+           premium_removed_by = NULL
+       WHERE id = $1`,
+      [userId, now, Number(t.expires_at), token]
+    );
+
+    await client.query(
+      `INSERT INTO premium_users(user_id, since, expires_at, token_used, removed_at, removed_by)
        VALUES($1,$2,$3,$4,NULL,NULL)
        ON CONFLICT (user_id) DO UPDATE
        SET since = EXCLUDED.since,
@@ -657,55 +706,51 @@ app.post("/api/validar-token", async (req, res) => {
       [userId, now, Number(t.expires_at), token]
     );
 
-    res.json({ ok: true, valid: true });
-
+    await client.query("COMMIT");
+    return res.json({ ok: true, valid: true, premiumUntil: Number(t.expires_at) });
   } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("VALIDAR_TOKEN_FAIL:", e);
-    res.status(500).json({ ok: false });
+    return res.status(500).json({ ok: false, reason: "VALIDAR_TOKEN_FAIL" });
+  } finally {
+    client.release();
   }
 });
 
 app.get("/api/is-premium/:userId", async (req, res) => {
-  const now = Date.now();
+  try {
+    await cleanupExpiredPremiumAccounts();
+    const r = await pool.query(
+      `SELECT premium, premium_until FROM users WHERE id=$1 LIMIT 1`,
+      [req.params.userId]
+    );
 
-  await pool.query(
-    `DELETE FROM premium_users
-     WHERE expires_at IS NOT NULL
-       AND expires_at < $1`,
-    [now]
-  );
-
-  const r = await pool.query(
-    `SELECT user_id
-     FROM premium_users
-     WHERE user_id=$1
-       AND (expires_at IS NULL OR expires_at >= $2)
-     LIMIT 1`,
-    [req.params.userId, now]
-  );
-
-  res.json({ ok: true, premium: r.rowCount > 0 });
+    const row = r.rows[0];
+    const premium = !!(row && row.premium && (!row.premium_until || Number(row.premium_until) > Date.now()));
+    res.json({ ok: true, premium, premiumUntil: row?.premium_until || null });
+  } catch (e) {
+    console.error("IS_PREMIUM_FAIL:", e);
+    res.status(500).json({ ok: false, premium: false });
+  }
 });
 
 app.get("/api/total-premium", async (req, res) => {
-  const now = Date.now();
+  try {
+    await cleanupExpiredPremiumAccounts();
+    const now = Date.now();
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS total
+       FROM users
+       WHERE premium = true
+         AND (premium_until IS NULL OR premium_until > $1)`,
+      [now]
+    );
 
-  await pool.query(
-    `DELETE FROM premium_users
-     WHERE expires_at IS NOT NULL
-       AND expires_at < $1`,
-    [now]
-  );
-
-  const r = await pool.query(
-    `SELECT COUNT(*)::int AS total
-     FROM premium_users
-     WHERE removed_at IS NULL
-       AND (expires_at IS NULL OR expires_at >= $1)`,
-    [now]
-  );
-
-  res.json({ ok: true, totalPremium: Number(r.rows[0]?.total || 0) });
+    res.json({ ok: true, totalPremium: Number(r.rows[0]?.total || 0) });
+  } catch (e) {
+    console.error("TOTAL_PREMIUM_FAIL:", e);
+    res.status(500).json({ ok: false, totalPremium: 0 });
+  }
 });
 
 app.get(
@@ -714,60 +759,40 @@ app.get(
   requireAdminOrMaster,
   async (req, res) => {
     try {
+      await cleanupExpiredPremiumAccounts();
       const now = Date.now();
-
-      await pool.query(
-        `DELETE FROM premium_users
-         WHERE expires_at IS NOT NULL
-           AND expires_at < $1`,
-        [now]
-      );
-
       const r = await pool.query(
-        `SELECT
-           pu.user_id,
-           COALESCE(NULLIF(TRIM(u.nick), ''), '(usuário não encontrado)') AS nick,
-           COALESCE(u.xp, 0) AS xp,
-           pu.since,
-           pu.expires_at,
-           pu.token_used,
-           pu.removed_at,
-           pu.removed_by
-         FROM premium_users pu
-         LEFT JOIN users u ON u.id = pu.user_id
-         WHERE (pu.expires_at IS NULL OR pu.expires_at >= $1)
-         ORDER BY
-           CASE WHEN pu.removed_at IS NULL THEN 0 ELSE 1 END ASC,
-           COALESCE(pu.expires_at, 9999999999999) DESC,
-           pu.since DESC`,
+        `SELECT id AS user_id,
+                nick,
+                xp,
+                premium_since AS since,
+                premium_until AS expires_at,
+                premium_token_used AS token_used,
+                premium_removed_at AS removed_at,
+                premium_removed_by AS removed_by,
+                false AS orphan
+         FROM users
+         WHERE premium = true
+           AND (premium_until IS NULL OR premium_until > $1)
+         ORDER BY premium_since DESC NULLS LAST, created_at DESC`,
         [now]
       );
 
-      const premiumUsers = r.rows.map(row => ({
-        user_id: row.user_id,
-        nick: row.nick,
-        xp: Number(row.xp || 0),
-        since: Number(row.since || 0),
-        expires_at: row.expires_at == null ? null : Number(row.expires_at),
-        token_used: row.token_used || null,
-        removed_at: row.removed_at == null ? null : Number(row.removed_at),
-        removed_by: row.removed_by || null,
-        active: row.removed_at == null,
+      const premiumUsers = r.rows.map((row) => ({
+        ...row,
+        token_masked: maskToken(row.token_used),
       }));
-
-      const activeUsers = premiumUsers.filter(u => u.active);
-      const removedUsers = premiumUsers.filter(u => !u.active);
 
       res.json({
         ok: true,
-        totalPremium: activeUsers.length,
-        premiumUsers: activeUsers,
-        users: activeUsers,
-        removedPremiumUsers: removedUsers,
+        totalPremium: premiumUsers.length,
+        premiumUsers,
+        users: premiumUsers,
+        removedPremiumUsers: [],
       });
     } catch (e) {
-      console.error("PREMIUM_USERS_LIST_FAIL:", e);
-      res.status(500).json({ ok: false, error: "PREMIUM_USERS_LIST_FAIL", message: String(e?.message || '') });
+      console.error("ADMIN_PREMIUM_USERS_FAIL:", e);
+      res.status(500).json({ ok: false, error: "ADMIN_PREMIUM_USERS_FAIL" });
     }
   }
 );
@@ -777,34 +802,49 @@ app.post(
   authOptional,
   requireAdminOrMaster,
   async (req, res) => {
+    const client = await pool.connect();
     try {
       const userId = (req.body?.userId || req.body?.id || "").toString().trim();
       if (!userId) {
         return res.status(400).json({ ok: false, error: "USER_ID_REQUIRED" });
       }
 
-      const removedBy =
-        (req.user && req.user.nick === MASTER_NICK) ? req.user.nick : "admin";
+      const removedBy = req.user?.nick === MASTER_NICK ? MASTER_NICK : "admin_key";
       const now = Date.now();
+      await client.query("BEGIN");
 
-      const r = await pool.query(
-        `UPDATE premium_users
-         SET removed_at = $2,
-             removed_by = $3,
-             expires_at = $2
-         WHERE user_id = $1
-         RETURNING user_id`,
+      const userUpdate = await client.query(
+        `UPDATE users
+         SET premium = false,
+             premium_removed_at = $2,
+             premium_removed_by = $3
+         WHERE id = $1
+         RETURNING id, nick`,
         [userId, now, removedBy]
       );
 
-      if (r.rowCount === 0) {
-        return res.status(404).json({ ok: false, error: "PREMIUM_NOT_FOUND" });
-      }
+      await client.query(
+        `UPDATE premium_users
+         SET removed_at = $2,
+             removed_by = $3,
+             expires_at = COALESCE(expires_at, $2)
+         WHERE user_id = $1`,
+        [userId, now, removedBy]
+      );
 
-      res.json({ ok: true, removedUserId: userId, removedAt: now, removedBy });
+      await client.query("COMMIT");
+      res.json({
+        ok: true,
+        removed: true,
+        userId,
+        nick: userUpdate.rows[0]?.nick || null,
+      });
     } catch (e) {
-      console.error("PREMIUM_USER_REMOVE_FAIL:", e);
-      res.status(500).json({ ok: false, error: "PREMIUM_USER_REMOVE_FAIL", message: String(e?.message || '') });
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("ADMIN_REMOVE_PREMIUM_FAIL:", e);
+      res.status(500).json({ ok: false, error: "ADMIN_REMOVE_PREMIUM_FAIL" });
+    } finally {
+      client.release();
     }
   }
 );
@@ -936,7 +976,7 @@ app.get("/api/visitors", async (req, res) => {
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT id, nick, xp, level, is_guest, message, created_at, deleted, deleted_by, deleted_at
+      SELECT nick, xp, level, is_guest, message, created_at
       FROM global_chat
       ORDER BY created_at ASC
       LIMIT 100
@@ -945,15 +985,11 @@ app.get('/api/global-chat/messages', async (req, res) => {
     res.json({
       ok: true,
       messages: r.rows.map(m => ({
-        id: m.id,
         nick: m.nick,
         xp: Number(m.xp || 0),
         level: Number(m.level || 1),
         is_guest: !!m.is_guest,
-        message: m.deleted ? 'Mensagem apagada pelo administrador' : m.message,
-        deleted: !!m.deleted,
-        deleted_by: m.deleted_by || null,
-        deleted_at: m.deleted_at == null ? null : Number(m.deleted_at),
+        message: m.message,
         created_at: Number(m.created_at || 0)
       }))
     });
@@ -1033,45 +1069,6 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
     res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
   }
 });
-
-app.post(
-  '/api/global-chat/delete',
-  authOptional,
-  requireAdminOrMaster,
-  async (req, res) => {
-    try {
-      if (!(req.user && req.user.nick === MASTER_NICK)) {
-        return res.status(403).json({ ok: false, error: 'MASTER_REQUIRED' });
-      }
-
-      const messageId = (req.body?.messageId || req.body?.id || '').toString().trim();
-      if (!messageId) {
-        return res.status(400).json({ ok: false, error: 'MESSAGE_ID_REQUIRED' });
-      }
-
-      const now = Date.now();
-      const r = await pool.query(
-        `UPDATE global_chat
-         SET deleted = true,
-             deleted_by = $2,
-             deleted_at = $3,
-             message = 'Mensagem apagada pelo administrador'
-         WHERE id = $1
-         RETURNING id`,
-        [messageId, MASTER_NICK, now]
-      );
-
-      if (r.rowCount === 0) {
-        return res.status(404).json({ ok: false, error: 'MESSAGE_NOT_FOUND' });
-      }
-
-      res.json({ ok: true, messageId });
-    } catch (e) {
-      console.error('GLOBAL_CHAT_DELETE_FAIL:', e);
-      res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_DELETE_FAIL' });
-    }
-  }
-);
 
 
 /* =========================
@@ -1174,6 +1171,41 @@ app.get("/api/chat/messages", auth, async (req, res) => {
 });
 
 /* 🔥 SUPER ADMIN VÊ TODOS CHATS (mesma rota admin) */
+
+app.post(
+  "/api/global-chat/delete",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const messageId = (req.body?.messageId || req.body?.id || "").toString().trim();
+      if (!messageId) {
+        return res.status(400).json({ ok: false, error: "MESSAGE_ID_REQUIRED" });
+      }
+      if (req.user?.nick !== MASTER_NICK) {
+        return res.status(403).json({ ok: false, error: "MASTER_ONLY" });
+      }
+
+      const now = Date.now();
+      const upd = await pool.query(
+        `UPDATE global_chat
+         SET message = 'Mensagem apagada pelo administrador'
+         WHERE id=$1
+         RETURNING id`,
+        [messageId]
+      );
+
+      if (!upd.rowCount) {
+        return res.status(404).json({ ok: false, error: "MESSAGE_NOT_FOUND" });
+      }
+
+      res.json({ ok: true, deleted: true, messageId, deletedAt: now });
+    } catch (e) {
+      console.error("GLOBAL_CHAT_DELETE_FAIL:", e);
+      res.status(500).json({ ok: false, error: "GLOBAL_CHAT_DELETE_FAIL" });
+    }
+  }
+);
 
 app.get(
   "/api/admin/chats",
