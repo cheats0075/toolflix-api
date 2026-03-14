@@ -655,6 +655,15 @@ app.post("/api/validar-token", async (req, res) => {
     if (!token || !userId)
       return res.status(400).json({ ok: false });
 
+    const userR = await pool.query(
+      `SELECT id, nick FROM users WHERE id=$1 LIMIT 1`,
+      [userId]
+    );
+
+    if (userR.rowCount === 0) {
+      return res.status(400).json({ ok: false, reason: "USER_NOT_FOUND" });
+    }
+
     const r = await pool.query(
       `SELECT * FROM tokens WHERE token=$1`,
       [token]
@@ -689,7 +698,14 @@ app.post("/api/validar-token", async (req, res) => {
       [userId, now, Number(t.expires_at), token]
     );
 
-    res.json({ ok: true, valid: true });
+    res.json({
+      ok: true,
+      valid: true,
+      user: {
+        id: userR.rows[0].id,
+        nick: userR.rows[0].nick
+      }
+    });
 
   } catch (e) {
     console.error("VALIDAR_TOKEN_FAIL:", e);
@@ -749,14 +765,15 @@ app.get(
       await cleanupExpiredPremiumUsers();
 
       const r = await pool.query(`
-        SELECT u.id AS user_id,
+        SELECT pu.user_id,
                u.nick,
                u.xp,
                pu.since,
                pu.expires_at,
-               pu.token_used
+               pu.token_used,
+               (u.id IS NULL) AS orphan
         FROM premium_users pu
-        INNER JOIN users u ON u.id = pu.user_id
+        LEFT JOIN users u ON u.id = pu.user_id
         ORDER BY pu.since DESC
       `);
 
@@ -764,11 +781,12 @@ app.get(
         ok: true,
         premiumUsers: r.rows.map(row => ({
           user_id: row.user_id,
-          nick: row.nick,
+          nick: row.nick || "(usuário não encontrado)",
           xp: Number(row.xp || 0),
           since: Number(row.since || 0),
           expires_at: row.expires_at ? Number(row.expires_at) : null,
-          token_used: row.token_used || null
+          token_used: row.token_used || null,
+          orphan: !!row.orphan
         }))
       });
     } catch (e) {
