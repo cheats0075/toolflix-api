@@ -311,6 +311,22 @@ async function initDb() {
     );
   `);
 
+  // moderação do chat geral
+  await pool.query(`
+    ALTER TABLE global_chat
+    ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false;
+  `);
+
+  await pool.query(`
+    ALTER TABLE global_chat
+    ADD COLUMN IF NOT EXISTS deleted_by TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE global_chat
+    ADD COLUMN IF NOT EXISTS deleted_at BIGINT;
+  `);
+
   await pool.query(`
     CREATE INDEX IF NOT EXISTS global_chat_created_idx
     ON global_chat(created_at ASC);
@@ -789,7 +805,7 @@ app.get("/api/visitors", async (req, res) => {
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT nick, xp, level, is_guest, message, created_at
+      SELECT id, nick, xp, level, is_guest, message, created_at, deleted, deleted_by, deleted_at
       FROM global_chat
       ORDER BY created_at ASC
       LIMIT 100
@@ -798,12 +814,16 @@ app.get('/api/global-chat/messages', async (req, res) => {
     res.json({
       ok: true,
       messages: r.rows.map(m => ({
+        id: m.id,
         nick: m.nick,
         xp: Number(m.xp || 0),
         level: Number(m.level || 1),
         is_guest: !!m.is_guest,
         message: m.message,
-        created_at: Number(m.created_at || 0)
+        created_at: Number(m.created_at || 0),
+        deleted: !!m.deleted,
+        deleted_by: m.deleted_by || null,
+        deleted_at: m.deleted_at ? Number(m.deleted_at) : null
       }))
     });
   } catch (e) {
@@ -880,6 +900,43 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
   } catch (e) {
     console.error('GLOBAL_CHAT_SEND_FAIL:', e);
     res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
+  }
+});
+
+
+// apagar mensagem somente no chat geral e somente pelo master
+app.post('/api/global-chat/delete', authOptional, async (req, res) => {
+  try {
+    if (!req.user || req.user.nick !== MASTER_NICK) {
+      return res.status(403).json({ ok: false, error: 'MASTER_REQUIRED' });
+    }
+
+    const messageId = (req.body?.messageId || req.body?.id || '').toString().trim();
+    if (!messageId) {
+      return res.status(400).json({ ok: false, error: 'MESSAGE_ID_REQUIRED' });
+    }
+
+    const now = Date.now();
+
+    const r = await pool.query(
+      `UPDATE global_chat
+       SET deleted = true,
+           deleted_by = $1,
+           deleted_at = $2,
+           message = 'Mensagem apagada pelo administrador'
+       WHERE id = $3
+       RETURNING id`,
+      [MASTER_NICK, now, messageId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'MESSAGE_NOT_FOUND' });
+    }
+
+    res.json({ ok: true, deleted: true, id: r.rows[0].id });
+  } catch (e) {
+    console.error('GLOBAL_CHAT_DELETE_FAIL:', e);
+    res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_DELETE_FAIL' });
   }
 });
 
