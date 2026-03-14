@@ -700,11 +700,12 @@ app.get("/api/total-premium", async (req, res) => {
   const r = await pool.query(
     `SELECT COUNT(*)::int AS total
      FROM premium_users
-     WHERE expires_at IS NULL OR expires_at >= $1`,
+     WHERE removed_at IS NULL
+       AND (expires_at IS NULL OR expires_at >= $1)`,
     [now]
   );
 
-  res.json({ ok: true, totalPremium: r.rows[0].total });
+  res.json({ ok: true, totalPremium: Number(r.rows[0]?.total || 0) });
 });
 
 app.get(
@@ -725,7 +726,7 @@ app.get(
       const r = await pool.query(
         `SELECT
            pu.user_id,
-           COALESCE(u.nick, '(usuário não encontrado)') AS nick,
+           COALESCE(NULLIF(TRIM(u.nick), ''), '(usuário não encontrado)') AS nick,
            COALESCE(u.xp, 0) AS xp,
            pu.since,
            pu.expires_at,
@@ -734,28 +735,39 @@ app.get(
            pu.removed_by
          FROM premium_users pu
          LEFT JOIN users u ON u.id = pu.user_id
-         WHERE pu.removed_at IS NULL
-           AND (pu.expires_at IS NULL OR pu.expires_at >= $1)
-         ORDER BY COALESCE(pu.expires_at, 9999999999999) DESC, pu.since DESC`,
+         WHERE (pu.expires_at IS NULL OR pu.expires_at >= $1)
+         ORDER BY
+           CASE WHEN pu.removed_at IS NULL THEN 0 ELSE 1 END ASC,
+           COALESCE(pu.expires_at, 9999999999999) DESC,
+           pu.since DESC`,
         [now]
       );
 
+      const premiumUsers = r.rows.map(row => ({
+        user_id: row.user_id,
+        nick: row.nick,
+        xp: Number(row.xp || 0),
+        since: Number(row.since || 0),
+        expires_at: row.expires_at == null ? null : Number(row.expires_at),
+        token_used: row.token_used || null,
+        removed_at: row.removed_at == null ? null : Number(row.removed_at),
+        removed_by: row.removed_by || null,
+        active: row.removed_at == null,
+      }));
+
+      const activeUsers = premiumUsers.filter(u => u.active);
+      const removedUsers = premiumUsers.filter(u => !u.active);
+
       res.json({
         ok: true,
-        premiumUsers: r.rows.map(row => ({
-          user_id: row.user_id,
-          nick: row.nick,
-          xp: Number(row.xp || 0),
-          since: Number(row.since || 0),
-          expires_at: row.expires_at == null ? null : Number(row.expires_at),
-          token_used: row.token_used || null,
-          removed_at: row.removed_at == null ? null : Number(row.removed_at),
-          removed_by: row.removed_by || null
-        }))
+        totalPremium: activeUsers.length,
+        premiumUsers: activeUsers,
+        users: activeUsers,
+        removedPremiumUsers: removedUsers,
       });
     } catch (e) {
       console.error("PREMIUM_USERS_LIST_FAIL:", e);
-      res.status(500).json({ ok: false, error: "PREMIUM_USERS_LIST_FAIL" });
+      res.status(500).json({ ok: false, error: "PREMIUM_USERS_LIST_FAIL", message: String(e?.message || '') });
     }
   }
 );
@@ -779,7 +791,7 @@ app.post(
         `UPDATE premium_users
          SET removed_at = $2,
              removed_by = $3,
-             expires_at = LEAST(COALESCE(expires_at, $2), $2)
+             expires_at = $2
          WHERE user_id = $1
          RETURNING user_id`,
         [userId, now, removedBy]
@@ -789,10 +801,10 @@ app.post(
         return res.status(404).json({ ok: false, error: "PREMIUM_NOT_FOUND" });
       }
 
-      res.json({ ok: true, removedUserId: userId });
+      res.json({ ok: true, removedUserId: userId, removedAt: now, removedBy });
     } catch (e) {
       console.error("PREMIUM_USER_REMOVE_FAIL:", e);
-      res.status(500).json({ ok: false, error: "PREMIUM_USER_REMOVE_FAIL" });
+      res.status(500).json({ ok: false, error: "PREMIUM_USER_REMOVE_FAIL", message: String(e?.message || '') });
     }
   }
 );
