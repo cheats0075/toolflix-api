@@ -694,18 +694,6 @@ app.post("/api/validar-token", async (req, res) => {
       [userId, now, Number(t.expires_at), token]
     );
 
-    await client.query(
-      `INSERT INTO premium_users(user_id, since, expires_at, token_used, removed_at, removed_by)
-       VALUES($1,$2,$3,$4,NULL,NULL)
-       ON CONFLICT (user_id) DO UPDATE
-       SET since = EXCLUDED.since,
-           expires_at = EXCLUDED.expires_at,
-           token_used = EXCLUDED.token_used,
-           removed_at = NULL,
-           removed_by = NULL`,
-      [userId, now, Number(t.expires_at), token]
-    );
-
     await client.query("COMMIT");
     return res.json({ ok: true, valid: true, premiumUntil: Number(t.expires_at) });
   } catch (e) {
@@ -823,15 +811,6 @@ app.post(
         [userId, now, removedBy]
       );
 
-      await client.query(
-        `UPDATE premium_users
-         SET removed_at = $2,
-             removed_by = $3,
-             expires_at = COALESCE(expires_at, $2)
-         WHERE user_id = $1`,
-        [userId, now, removedBy]
-      );
-
       await client.query("COMMIT");
       res.json({
         ok: true,
@@ -843,6 +822,49 @@ app.post(
       await client.query("ROLLBACK").catch(() => {});
       console.error("ADMIN_REMOVE_PREMIUM_FAIL:", e);
       res.status(500).json({ ok: false, error: "ADMIN_REMOVE_PREMIUM_FAIL" });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+
+app.post(
+  "/api/admin/premium-reset-all",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const removedBy = req.user?.nick === MASTER_NICK ? MASTER_NICK : "admin_key";
+      const now = Date.now();
+      await client.query("BEGIN");
+
+      const usersReset = await client.query(
+        `UPDATE users
+         SET premium = false,
+             premium_since = NULL,
+             premium_until = NULL,
+             premium_token_used = NULL,
+             premium_removed_at = $1,
+             premium_removed_by = $2
+         WHERE premium = true`,
+        [now, removedBy]
+      );
+
+      const legacyCleared = await client.query(`DELETE FROM premium_users`);
+
+      await client.query("COMMIT");
+      res.json({
+        ok: true,
+        reset: true,
+        usersUpdated: usersReset.rowCount || 0,
+        legacyDeleted: legacyCleared.rowCount || 0,
+      });
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error("ADMIN_PREMIUM_RESET_ALL_FAIL:", e);
+      res.status(500).json({ ok: false, error: "ADMIN_PREMIUM_RESET_ALL_FAIL" });
     } finally {
       client.release();
     }
