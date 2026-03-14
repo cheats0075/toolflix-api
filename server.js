@@ -136,6 +136,17 @@ function getVisitorKey(req) {
 }
 
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
+
+async function cleanupExpiredPremiumUsers() {
+  try {
+    await pool.query(
+      `DELETE FROM premium_users WHERE expires_at IS NOT NULL AND expires_at < $1`,
+      [Date.now()]
+    );
+  } catch (e) {
+    console.error("PREMIUM_CLEANUP_FAIL:", e);
+  }
+}
 /* =========================
    INIT DATABASE
 ========================= */
@@ -247,6 +258,26 @@ async function initDb() {
       user_id TEXT PRIMARY KEY,
       since BIGINT NOT NULL
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE premium_users
+    ADD COLUMN IF NOT EXISTS expires_at BIGINT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE premium_users
+    ADD COLUMN IF NOT EXISTS token_used TEXT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE premium_users
+    ADD COLUMN IF NOT EXISTS removed_at BIGINT;
+  `);
+
+  await pool.query(`
+    ALTER TABLE premium_users
+    ADD COLUMN IF NOT EXISTS removed_by TEXT;
   `);
   /* =========================
      VISITAS (CONTADOR GLOBAL)
@@ -647,10 +678,15 @@ app.post("/api/validar-token", async (req, res) => {
     );
 
     await pool.query(
-      `INSERT INTO premium_users(user_id,since)
-       VALUES($1,$2)
-       ON CONFLICT (user_id) DO NOTHING`,
-      [userId, now]
+      `INSERT INTO premium_users(user_id,since,expires_at,token_used,removed_at,removed_by)
+       VALUES($1,$2,$3,$4,NULL,NULL)
+       ON CONFLICT (user_id) DO UPDATE
+       SET since = EXCLUDED.since,
+           expires_at = EXCLUDED.expires_at,
+           token_used = EXCLUDED.token_used,
+           removed_at = NULL,
+           removed_by = NULL`,
+      [userId, now, Number(t.expires_at), token]
     );
 
     res.json({ ok: true, valid: true });
@@ -662,21 +698,136 @@ app.post("/api/validar-token", async (req, res) => {
 });
 
 app.get("/api/is-premium/:userId", async (req, res) => {
-  const r = await pool.query(
-    `SELECT user_id FROM premium_users WHERE user_id=$1 LIMIT 1`,
-    [req.params.userId]
-  );
+  try {
+    await cleanupExpiredPremiumUsers();
 
-  res.json({ ok: true, premium: r.rowCount > 0 });
+    const r = await pool.query(
+      `SELECT user_id, expires_at FROM premium_users WHERE user_id=$1 LIMIT 1`,
+      [req.params.userId]
+    );
+
+    if (r.rowCount === 0) {
+      return res.json({ ok: true, premium: false });
+    }
+
+    const expiresAt = r.rows[0]?.expires_at ? Number(r.rows[0].expires_at) : null;
+    const premium = !expiresAt || expiresAt >= Date.now();
+
+    if (!premium) {
+      await pool.query(`DELETE FROM premium_users WHERE user_id=$1`, [req.params.userId]);
+      return res.json({ ok: true, premium: false });
+    }
+
+    res.json({ ok: true, premium: true, expiresAt });
+  } catch (e) {
+    console.error("IS_PREMIUM_FAIL:", e);
+    res.status(500).json({ ok: false, error: "IS_PREMIUM_FAIL" });
+  }
 });
 
 app.get("/api/total-premium", async (req, res) => {
-  const r = await pool.query(
-    `SELECT COUNT(*)::int AS total FROM premium_users`
-  );
+  try {
+    await cleanupExpiredPremiumUsers();
 
-  res.json({ ok: true, totalPremium: r.rows[0].total });
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM premium_users`
+    );
+
+    res.json({ ok: true, totalPremium: r.rows[0].total });
+  } catch (e) {
+    console.error("TOTAL_PREMIUM_FAIL:", e);
+    res.status(500).json({ ok: false, error: "TOTAL_PREMIUM_FAIL" });
+  }
 });
+
+app.get(
+  "/api/admin/premium-users",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      await cleanupExpiredPremiumUsers();
+
+      const r = await pool.query(`
+        SELECT u.id AS user_id,
+               u.nick,
+               u.xp,
+               pu.since,
+               pu.expires_at,
+               pu.token_used
+        FROM premium_users pu
+        INNER JOIN users u ON u.id = pu.user_id
+        ORDER BY pu.since DESC
+      `);
+
+      res.json({
+        ok: true,
+        premiumUsers: r.rows.map(row => ({
+          user_id: row.user_id,
+          nick: row.nick,
+          xp: Number(row.xp || 0),
+          since: Number(row.since || 0),
+          expires_at: row.expires_at ? Number(row.expires_at) : null,
+          token_used: row.token_used || null
+        }))
+      });
+    } catch (e) {
+      console.error("ADMIN_PREMIUM_LIST_FAIL:", e);
+      res.status(500).json({ ok: false, error: "ADMIN_PREMIUM_LIST_FAIL" });
+    }
+  }
+);
+
+app.post(
+  "/api/admin/premium-users/remove",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const userId = (req.body?.userId || "").toString().trim();
+      const nick = (req.body?.nick || "").toString().trim();
+
+      if (!userId && !nick) {
+        return res.status(400).json({ ok: false, error: "USER_ID_OR_NICK_REQUIRED" });
+      }
+
+      let targetUserId = userId;
+      if (!targetUserId && nick) {
+        const ur = await pool.query(
+          `SELECT id FROM users WHERE nick=$1 LIMIT 1`,
+          [nick]
+        );
+        if (ur.rowCount === 0) {
+          return res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
+        }
+        targetUserId = ur.rows[0].id;
+      }
+
+      const removedBy = req.user?.nick === MASTER_NICK ? MASTER_NICK : "admin";
+      const now = Date.now();
+
+      const mark = await pool.query(
+        `UPDATE premium_users
+         SET removed_at = $2,
+             removed_by = $3
+         WHERE user_id = $1
+         RETURNING user_id`,
+        [targetUserId, now, removedBy]
+      );
+
+      if (mark.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "PREMIUM_NOT_FOUND" });
+      }
+
+      await pool.query(`DELETE FROM premium_users WHERE user_id=$1`, [targetUserId]);
+
+      res.json({ ok: true, removed: true, userId: targetUserId });
+    } catch (e) {
+      console.error("ADMIN_PREMIUM_REMOVE_FAIL:", e);
+      res.status(500).json({ ok: false, error: "ADMIN_PREMIUM_REMOVE_FAIL" });
+    }
+  }
+);
 
 /* =========================
    VISITAS (CONTADOR REAL)
