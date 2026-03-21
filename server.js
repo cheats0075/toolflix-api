@@ -486,7 +486,7 @@ async function initDb() {
 
 initDb()
   .then(() => {
-    console.log("✅ Banco OK - frames groundwork");
+    console.log("✅ Banco OK - frames/chat/avatar final sync");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
     );
