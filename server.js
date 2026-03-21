@@ -420,7 +420,7 @@ async function initDb() {
 
 initDb()
   .then(() => {
-    console.log("✅ Banco OK");
+    console.log("✅ Banco OK - avatar/chat/visitors fix final");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
     );
