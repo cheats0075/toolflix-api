@@ -420,7 +420,7 @@ async function initDb() {
 
 initDb()
   .then(() => {
-    console.log("✅ Banco OK - avatar/chat/visitors fix final");
+    console.log("✅ Banco OK");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
     );
@@ -1134,7 +1134,7 @@ app.get("/api/visitors", async (req, res) => {
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT nick, xp, level, avatar_level, is_guest, message, created_at
+      SELECT id, nick, xp, level, avatar_level, is_guest, message, created_at
       FROM global_chat
       ORDER BY created_at ASC
       LIMIT 100
@@ -1147,14 +1147,18 @@ app.get('/api/global-chat/messages', async (req, res) => {
         const isGuest = !!m.is_guest;
         const level = isGuest ? 1 : Math.max(1, Number(m.level || getLevelFromXp(xp)));
         const avatarLevel = isGuest ? 1 : getEquippedAvatarLevel(level, m.avatar_level);
+        const text = String(m.message || '');
+        const deleted = text === 'Mensagem apagada pelo administrador';
         return {
+          id: m.id,
           nick: m.nick,
           xp,
           level,
           avatar_level: avatarLevel,
           avatar: getAvatarFromLevel(avatarLevel),
           is_guest: isGuest,
-          message: m.message,
+          message: text,
+          deleted,
           created_at: Number(m.created_at || 0)
         };
       })
