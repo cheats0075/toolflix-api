@@ -137,6 +137,47 @@ function getVisitorKey(req) {
 
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
 
+
+function getLevelFromXp(rawXp) {
+  const xp = Math.max(0, Number(rawXp || 0));
+
+  if (xp < 100) return 1;
+  if (xp < 250) return 2;
+  if (xp < 500) return 3;
+  if (xp < 750) return 4;
+  if (xp < 1250) return 5;
+
+  let level = 6;
+  let min = 1250;
+  let max = 1900;
+
+  while (xp >= max) {
+    level++;
+    min = max;
+    const delta = 650 + (level - 7) * 150;
+    max = min + delta;
+    if (level > 1000) break;
+  }
+
+  return level;
+}
+
+function getAvatarFromLevel(rawLevel) {
+  const level = Math.max(1, Math.min(15, Number(rawLevel || 1)));
+  return `/assets/img/avatars/level-${level}.webp`;
+}
+
+function attachUserProgress(data) {
+  const xp = Math.max(0, Number(data?.xp || 0));
+  const level = getLevelFromXp(xp);
+  return {
+    ...data,
+    xp,
+    level,
+    avatar: getAvatarFromLevel(level),
+  };
+}
+
 async function cleanupExpiredPremiumAccounts() {
   const now = Date.now();
   await pool.query(`
@@ -445,11 +486,11 @@ app.post("/api/login", async (req, res) => {
     res.json({
       ok: true,
       token,
-      user: {
+      user: attachUserProgress({
         id: user.id,
         nick: user.nick,
         xp: Number(user.xp || 0),
-      },
+      }),
     });
 
   } catch (e) {
@@ -470,7 +511,7 @@ app.get("/api/me", auth, async (req, res) => {
   if (r.rowCount === 0)
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-  res.json({ ok: true, user: r.rows[0] });
+  res.json({ ok: true, user: attachUserProgress(r.rows[0]) });
 });
 
 app.post("/api/add-xp", auth, async (req, res) => {
@@ -485,11 +526,19 @@ app.post("/api/add-xp", auth, async (req, res) => {
   );
 
   const r = await pool.query(
-    `SELECT xp FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT id,nick,xp FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
-  res.json({ ok: true, xp: Number(r.rows[0]?.xp || 0) });
+  const user = attachUserProgress(r.rows[0] || { id: req.user.id, nick: req.user.nick, xp: 0 });
+
+  res.json({
+    ok: true,
+    xp: user.xp,
+    level: user.level,
+    avatar: user.avatar,
+    user,
+  });
 });
 
 /* =========================
@@ -917,13 +966,19 @@ app.post("/api/visitor", authOptional, async (req, res) => {
   try {
     const now = Date.now();
     const visitorKey = getVisitorKey(req);
-    const nick = req.user?.nick || "Visitante";
+    let nick = req.user?.nick || "Visitante";
     const userId = req.user?.id || null;
 
     let xp = 0;
+    let level = 1;
+    let avatar = getAvatarFromLevel(1);
+
     if (userId) {
-      const ur = await pool.query(`SELECT xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT nick, xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      nick = ur.rows[0]?.nick || nick;
       xp = Number(ur.rows[0]?.xp || 0);
+      level = getLevelFromXp(xp);
+      avatar = getAvatarFromLevel(level);
     }
 
     await pool.query(
@@ -938,7 +993,7 @@ app.post("/api/visitor", authOptional, async (req, res) => {
       [visitorKey, userId, nick, xp, !userId, now]
     );
 
-    res.json({ ok: true });
+    res.json({ ok: true, nick, xp, level, avatar });
   } catch (e) {
     console.error("VISITOR_POST_FAIL:", e);
     res.status(500).json({ ok: false, error: "VISITOR_POST_FAIL" });
@@ -971,18 +1026,32 @@ app.get("/api/visitors", async (req, res) => {
     res.json({
       ok: true,
       onlineCount: onlineR.rowCount,
-      online: onlineR.rows.map(r => ({
-        nick: r.nick,
-        xp: Number(r.xp || 0),
-        is_guest: !!r.is_guest,
-        last_seen_at: Number(r.last_seen_at || 0),
-      })),
-      lastSeen: lastSeenR.rows.map(r => ({
-        nick: r.nick,
-        xp: Number(r.xp || 0),
-        is_guest: !!r.is_guest,
-        last_seen_at: Number(r.last_seen_at || 0),
-      })),
+      online: onlineR.rows.map(r => {
+        const xp = Number(r.xp || 0);
+        const isGuest = !!r.is_guest;
+        const level = isGuest ? 1 : getLevelFromXp(xp);
+        return {
+          nick: r.nick,
+          xp,
+          level,
+          avatar: getAvatarFromLevel(level),
+          is_guest: isGuest,
+          last_seen_at: Number(r.last_seen_at || 0),
+        };
+      }),
+      lastSeen: lastSeenR.rows.map(r => {
+        const xp = Number(r.xp || 0);
+        const isGuest = !!r.is_guest;
+        const level = isGuest ? 1 : getLevelFromXp(xp);
+        return {
+          nick: r.nick,
+          xp,
+          level,
+          avatar: getAvatarFromLevel(level),
+          is_guest: isGuest,
+          last_seen_at: Number(r.last_seen_at || 0),
+        };
+      }),
     });
   } catch (e) {
     console.error("VISITORS_GET_FAIL:", e);
@@ -1006,14 +1075,20 @@ app.get('/api/global-chat/messages', async (req, res) => {
 
     res.json({
       ok: true,
-      messages: r.rows.map(m => ({
-        nick: m.nick,
-        xp: Number(m.xp || 0),
-        level: Number(m.level || 1),
-        is_guest: !!m.is_guest,
-        message: m.message,
-        created_at: Number(m.created_at || 0)
-      }))
+      messages: r.rows.map(m => {
+        const xp = Number(m.xp || 0);
+        const isGuest = !!m.is_guest;
+        const level = isGuest ? 1 : Math.max(1, Number(m.level || getLevelFromXp(xp)));
+        return {
+          nick: m.nick,
+          xp,
+          level,
+          avatar: getAvatarFromLevel(level),
+          is_guest: isGuest,
+          message: m.message,
+          created_at: Number(m.created_at || 0)
+        };
+      })
     });
   } catch (e) {
     console.error('GLOBAL_CHAT_MESSAGES_FAIL:', e);
@@ -1053,22 +1128,7 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       const ur = await pool.query(`SELECT nick, xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
       nick = ur.rows[0]?.nick || nick || 'Usuário';
       xp = Number(ur.rows[0]?.xp || 0);
-      if (xp < 100) level = 1;
-      else if (xp < 250) level = 2;
-      else if (xp < 500) level = 3;
-      else if (xp < 750) level = 4;
-      else if (xp < 1250) level = 5;
-      else {
-        level = 6;
-        let min = 1250, max = 1900;
-        while (xp >= max) {
-          level++;
-          min = max;
-          const delta = 650 + (level - 7) * 150;
-          max = min + delta;
-          if (level > 1000) break;
-        }
-      }
+      level = getLevelFromXp(xp);
     } else {
       const raw = senderKey.replace(/^guest:/, '');
       const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
@@ -1085,7 +1145,19 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       [msgId, senderKey, userId, nick, xp, level, isGuest, text, now]
     );
 
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      message: {
+        id: msgId,
+        nick,
+        xp,
+        level,
+        avatar: getAvatarFromLevel(level),
+        is_guest: isGuest,
+        message: text,
+        created_at: now,
+      }
+    });
   } catch (e) {
     console.error('GLOBAL_CHAT_SEND_FAIL:', e);
     res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
