@@ -486,7 +486,7 @@ async function initDb() {
 
 initDb()
   .then(() => {
-    console.log("✅ Banco OK - frames/chat/avatar final sync");
+    console.log("✅ Banco OK - frames/chat/avatar js step 1");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
     );
@@ -1465,9 +1465,9 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
 
     const msgId = 'gc_' + Math.random().toString(36).slice(2, 10);
     await pool.query(
-      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,avatar_level,is_guest,message,created_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [msgId, senderKey, userId, nick, xp, level, avatarLevel, isGuest, text, now]
+      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,avatar_level,frame_level,is_guest,message,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [msgId, senderKey, userId, nick, xp, level, avatarLevel, frameLevel, isGuest, text, now]
     );
 
     res.json({
