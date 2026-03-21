@@ -378,6 +378,11 @@ async function initDb() {
   `);
 
   await pool.query(`
+    ALTER TABLE site_visitors
+    ADD COLUMN IF NOT EXISTS avatar_level BIGINT;
+  `);
+
+  await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS site_visitors_visitor_key_unique
     ON site_visitors(visitor_key);
   `);
@@ -404,6 +409,11 @@ async function initDb() {
       message TEXT NOT NULL,
       created_at BIGINT NOT NULL
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE global_chat
+    ADD COLUMN IF NOT EXISTS avatar_level BIGINT;
   `);
 
   await pool.query(`
@@ -1099,8 +1109,8 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar_level: item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level),
-          avatar: getAvatarFromLevel(item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level)),
+          avatar_level: isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level),
+          avatar: getAvatarFromLevel(isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1113,8 +1123,8 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar_level: item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level),
-          avatar: getAvatarFromLevel(item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level)),
+          avatar_level: isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level),
+          avatar: getAvatarFromLevel(isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1199,6 +1209,7 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       nick = ur.rows[0]?.nick || nick || 'Usuário';
       xp = Number(ur.rows[0]?.xp || 0);
       level = getLevelFromXp(xp);
+      avatarLevel = getEquippedAvatarLevel(level, ur.rows[0]?.avatar_selected_level);
     } else {
       const raw = senderKey.replace(/^guest:/, '');
       const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
