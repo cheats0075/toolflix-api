@@ -167,14 +167,33 @@ function getAvatarFromLevel(rawLevel) {
   return `/assets/img/avatars/level-${level}.webp`;
 }
 
+function getUnlockedAvatarLevels(rawLevel) {
+  const maxLevel = Math.max(1, Math.min(15, Number(rawLevel || 1)));
+  const list = [];
+  for (let i = 1; i <= maxLevel; i++) list.push(i);
+  return list;
+}
+
+function getEquippedAvatarLevel(currentLevel, selectedLevel) {
+  const unlockedMax = Math.max(1, Math.min(15, Number(currentLevel || 1)));
+  const selected = Number(selectedLevel || 0);
+  if (selected >= 1 && selected <= unlockedMax) return selected;
+  return unlockedMax;
+}
+
 function attachUserProgress(data) {
   const xp = Math.max(0, Number(data?.xp || 0));
   const level = getLevelFromXp(xp);
+  const avatarSelectedLevel = Number(data?.avatar_selected_level || 0);
+  const avatarLevel = getEquippedAvatarLevel(level, avatarSelectedLevel);
   return {
     ...data,
     xp,
     level,
-    avatar: getAvatarFromLevel(level),
+    avatar_selected_level: avatarSelectedLevel > 0 ? avatarSelectedLevel : null,
+    avatar_level: avatarLevel,
+    unlocked_avatar_levels: getUnlockedAvatarLevels(level),
+    avatar: getAvatarFromLevel(avatarLevel),
   };
 }
 
@@ -223,7 +242,8 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS premium_until BIGINT,
     ADD COLUMN IF NOT EXISTS premium_token_used TEXT,
     ADD COLUMN IF NOT EXISTS premium_removed_at BIGINT,
-    ADD COLUMN IF NOT EXISTS premium_removed_by TEXT;
+    ADD COLUMN IF NOT EXISTS premium_removed_by TEXT,
+    ADD COLUMN IF NOT EXISTS avatar_selected_level BIGINT;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
@@ -350,6 +370,7 @@ async function initDb() {
       user_id TEXT,
       nick TEXT NOT NULL,
       xp BIGINT DEFAULT 0,
+      avatar_level BIGINT,
       is_guest BOOLEAN DEFAULT true,
       first_seen_at BIGINT NOT NULL,
       last_seen_at BIGINT NOT NULL
@@ -378,6 +399,7 @@ async function initDb() {
       nick TEXT NOT NULL,
       xp BIGINT DEFAULT 0,
       level BIGINT DEFAULT 1,
+      avatar_level BIGINT,
       is_guest BOOLEAN DEFAULT true,
       message TEXT NOT NULL,
       created_at BIGINT NOT NULL
@@ -490,6 +512,7 @@ app.post("/api/login", async (req, res) => {
         id: user.id,
         nick: user.nick,
         xp: Number(user.xp || 0),
+        avatar_selected_level: Number(user.avatar_selected_level || 0),
       }),
     });
 
@@ -504,7 +527,7 @@ app.post("/api/login", async (req, res) => {
 
 app.get("/api/me", auth, async (req, res) => {
   const r = await pool.query(
-    `SELECT id,nick,xp FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT id,nick,xp,avatar_selected_level FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
@@ -512,6 +535,45 @@ app.get("/api/me", auth, async (req, res) => {
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
   res.json({ ok: true, user: attachUserProgress(r.rows[0]) });
+});
+
+app.post("/api/avatar/select", auth, async (req, res) => {
+  try {
+    const requestedLevel = Number(req.body?.level || 0);
+
+    if (!Number.isFinite(requestedLevel) || requestedLevel < 1 || requestedLevel > 15) {
+      return res.status(400).json({ ok: false, error: "AVATAR_LEVEL_INVALID" });
+    }
+
+    const r = await pool.query(
+      `SELECT id,nick,xp,avatar_selected_level FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    const current = attachUserProgress(r.rows[0]);
+    if (requestedLevel > current.avatar_level && requestedLevel > Math.min(15, current.level)) {
+      return res.status(400).json({ ok: false, error: "AVATAR_LOCKED", need_level: requestedLevel });
+    }
+
+    await pool.query(
+      `UPDATE users SET avatar_selected_level=$1 WHERE id=$2`,
+      [requestedLevel, req.user.id]
+    );
+
+    const updated = attachUserProgress({
+      ...r.rows[0],
+      avatar_selected_level: requestedLevel,
+    });
+
+    res.json({ ok: true, user: updated, avatar: updated.avatar, avatar_level: updated.avatar_level });
+  } catch (e) {
+    console.error("AVATAR_SELECT_FAIL:", e);
+    res.status(500).json({ ok: false, error: "AVATAR_SELECT_FAIL" });
+  }
 });
 
 app.post("/api/add-xp", auth, async (req, res) => {
@@ -526,11 +588,11 @@ app.post("/api/add-xp", auth, async (req, res) => {
   );
 
   const r = await pool.query(
-    `SELECT id,nick,xp FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT id,nick,xp,avatar_selected_level FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
-  const user = attachUserProgress(r.rows[0] || { id: req.user.id, nick: req.user.nick, xp: 0 });
+  const user = attachUserProgress(r.rows[0] || { id: req.user.id, nick: req.user.nick, xp: 0, avatar_selected_level: 0 });
 
   res.json({
     ok: true,
@@ -971,26 +1033,29 @@ app.post("/api/visitor", authOptional, async (req, res) => {
 
     let xp = 0;
     let level = 1;
+    let avatarLevel = 1;
     let avatar = getAvatarFromLevel(1);
 
     if (userId) {
-      const ur = await pool.query(`SELECT nick, xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT nick, xp, avatar_selected_level FROM users WHERE id=$1 LIMIT 1`, [userId]);
       nick = ur.rows[0]?.nick || nick;
       xp = Number(ur.rows[0]?.xp || 0);
       level = getLevelFromXp(xp);
-      avatar = getAvatarFromLevel(level);
+      avatarLevel = getEquippedAvatarLevel(level, ur.rows[0]?.avatar_selected_level);
+      avatar = getAvatarFromLevel(avatarLevel);
     }
 
     await pool.query(
-      `INSERT INTO site_visitors(visitor_key,user_id,nick,xp,is_guest,first_seen_at,last_seen_at)
-       VALUES($1,$2,$3,$4,$5,$6,$6)
+      `INSERT INTO site_visitors(visitor_key,user_id,nick,xp,avatar_level,is_guest,first_seen_at,last_seen_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$7)
        ON CONFLICT (visitor_key) DO UPDATE
        SET user_id = EXCLUDED.user_id,
            nick = EXCLUDED.nick,
            xp = EXCLUDED.xp,
+           avatar_level = EXCLUDED.avatar_level,
            is_guest = EXCLUDED.is_guest,
            last_seen_at = EXCLUDED.last_seen_at`,
-      [visitorKey, userId, nick, xp, !userId, now]
+      [visitorKey, userId, nick, xp, avatarLevel, !userId, now]
     );
 
     res.json({ ok: true, nick, xp, level, avatar });
@@ -1006,7 +1071,7 @@ app.get("/api/visitors", async (req, res) => {
     const onlineMin = now - ONLINE_WINDOW_MS;
 
     const onlineR = await pool.query(
-      `SELECT nick, xp, is_guest, last_seen_at
+      `SELECT nick, xp, avatar_level, is_guest, last_seen_at
        FROM site_visitors
        WHERE last_seen_at >= $1
        ORDER BY last_seen_at DESC
@@ -1015,7 +1080,7 @@ app.get("/api/visitors", async (req, res) => {
     );
 
     const lastSeenR = await pool.query(
-      `SELECT nick, xp, is_guest, last_seen_at
+      `SELECT nick, xp, avatar_level, is_guest, last_seen_at
        FROM site_visitors
        WHERE last_seen_at < $1
        ORDER BY last_seen_at DESC
@@ -1034,7 +1099,8 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar: getAvatarFromLevel(level),
+          avatar_level: item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level),
+          avatar: getAvatarFromLevel(item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1047,7 +1113,8 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar: getAvatarFromLevel(level),
+          avatar_level: item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level),
+          avatar: getAvatarFromLevel(item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1067,7 +1134,7 @@ app.get("/api/visitors", async (req, res) => {
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT nick, xp, level, is_guest, message, created_at
+      SELECT nick, xp, level, avatar_level, is_guest, message, created_at
       FROM global_chat
       ORDER BY created_at ASC
       LIMIT 100
@@ -1079,11 +1146,13 @@ app.get('/api/global-chat/messages', async (req, res) => {
         const xp = Number(m.xp || 0);
         const isGuest = !!m.is_guest;
         const level = isGuest ? 1 : Math.max(1, Number(m.level || getLevelFromXp(xp)));
+        const avatarLevel = isGuest ? 1 : getEquippedAvatarLevel(level, m.avatar_level);
         return {
           nick: m.nick,
           xp,
           level,
-          avatar: getAvatarFromLevel(level),
+          avatar_level: avatarLevel,
+          avatar: getAvatarFromLevel(avatarLevel),
           is_guest: isGuest,
           message: m.message,
           created_at: Number(m.created_at || 0)
@@ -1122,10 +1191,11 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
     let userId = req.user?.id || null;
     let xp = 0;
     let level = 1;
+    let avatarLevel = 1;
     let isGuest = !userId;
 
     if (userId) {
-      const ur = await pool.query(`SELECT nick, xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT nick, xp, avatar_selected_level FROM users WHERE id=$1 LIMIT 1`, [userId]);
       nick = ur.rows[0]?.nick || nick || 'Usuário';
       xp = Number(ur.rows[0]?.xp || 0);
       level = getLevelFromXp(xp);
@@ -1135,14 +1205,15 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       nick = `Usuário ${suffix}`;
       xp = 0;
       level = 1;
+      avatarLevel = 1;
       isGuest = true;
     }
 
     const msgId = 'gc_' + Math.random().toString(36).slice(2, 10);
     await pool.query(
-      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,is_guest,message,created_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [msgId, senderKey, userId, nick, xp, level, isGuest, text, now]
+      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,avatar_level,is_guest,message,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [msgId, senderKey, userId, nick, xp, level, avatarLevel, isGuest, text, now]
     );
 
     res.json({
@@ -1152,7 +1223,8 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
         nick,
         xp,
         level,
-        avatar: getAvatarFromLevel(level),
+        avatar_level: avatarLevel,
+        avatar: getAvatarFromLevel(avatarLevel),
         is_guest: isGuest,
         message: text,
         created_at: now,
