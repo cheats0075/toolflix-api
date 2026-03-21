@@ -136,6 +136,8 @@ function getVisitorKey(req) {
 }
 
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
+const MAX_AVATAR_LEVEL = 15;
+const MAX_FRAME_LEVEL = 30;
 
 
 function getLevelFromXp(rawXp) {
@@ -163,22 +165,43 @@ function getLevelFromXp(rawXp) {
 }
 
 function getAvatarFromLevel(rawLevel) {
-  const level = Math.max(1, Math.min(15, Number(rawLevel || 1)));
+  const level = Math.max(1, Math.min(MAX_AVATAR_LEVEL, Number(rawLevel || 1)));
   return `/assets/img/avatars/level-${level}.webp`;
 }
 
+function getFrameFromLevel(rawLevel) {
+  const level = Math.max(1, Math.min(MAX_FRAME_LEVEL, Number(rawLevel || 1)));
+  return `/assets/img/molduras/avatar-${level}.png`;
+}
+
+function sanitizeUnlockedFrameLevels(levels) {
+  const set = new Set([1]);
+  for (const raw of Array.isArray(levels) ? levels : []) {
+    const level = Number(raw || 0);
+    if (Number.isFinite(level) && level >= 1 && level <= MAX_FRAME_LEVEL) set.add(level);
+  }
+  return Array.from(set).sort((a, b) => a - b);
+}
+
 function getUnlockedAvatarLevels(rawLevel) {
-  const maxLevel = Math.max(1, Math.min(15, Number(rawLevel || 1)));
+  const maxLevel = Math.max(1, Math.min(MAX_AVATAR_LEVEL, Number(rawLevel || 1)));
   const list = [];
   for (let i = 1; i <= maxLevel; i++) list.push(i);
   return list;
 }
 
 function getEquippedAvatarLevel(currentLevel, selectedLevel) {
-  const unlockedMax = Math.max(1, Math.min(15, Number(currentLevel || 1)));
+  const unlockedMax = Math.max(1, Math.min(MAX_AVATAR_LEVEL, Number(currentLevel || 1)));
   const selected = Number(selectedLevel || 0);
   if (selected >= 1 && selected <= unlockedMax) return selected;
   return unlockedMax;
+}
+
+function getEquippedFrameLevel(unlockedLevels, selectedLevel) {
+  const unlocked = sanitizeUnlockedFrameLevels(unlockedLevels);
+  const selected = Number(selectedLevel || 0);
+  if (selected >= 1 && unlocked.includes(selected)) return selected;
+  return unlocked[0] || 1;
 }
 
 function attachUserProgress(data) {
@@ -186,6 +209,9 @@ function attachUserProgress(data) {
   const level = getLevelFromXp(xp);
   const avatarSelectedLevel = Number(data?.avatar_selected_level || 0);
   const avatarLevel = getEquippedAvatarLevel(level, avatarSelectedLevel);
+  const unlockedFrameLevels = sanitizeUnlockedFrameLevels(data?.unlocked_frame_levels || []);
+  const frameSelectedLevel = Number(data?.frame_selected_level || 0);
+  const frameLevel = getEquippedFrameLevel(unlockedFrameLevels, frameSelectedLevel);
   return {
     ...data,
     xp,
@@ -194,7 +220,20 @@ function attachUserProgress(data) {
     avatar_level: avatarLevel,
     unlocked_avatar_levels: getUnlockedAvatarLevels(level),
     avatar: getAvatarFromLevel(avatarLevel),
+    frame_selected_level: frameSelectedLevel > 0 ? frameSelectedLevel : null,
+    unlocked_frame_levels: unlockedFrameLevels,
+    frame_level: frameLevel,
+    frame: getFrameFromLevel(frameLevel),
   };
+}
+
+async function getUnlockedFrameLevelsForUser(userId) {
+  if (!userId) return [1];
+  const r = await pool.query(
+    `SELECT frame_level FROM user_frame_unlocks WHERE user_id=$1 ORDER BY frame_level ASC`,
+    [userId]
+  );
+  return sanitizeUnlockedFrameLevels(r.rows.map((row) => Number(row.frame_level || 0)));
 }
 
 async function cleanupExpiredPremiumAccounts() {
@@ -243,10 +282,25 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS premium_token_used TEXT,
     ADD COLUMN IF NOT EXISTS premium_removed_at BIGINT,
     ADD COLUMN IF NOT EXISTS premium_removed_by TEXT,
-    ADD COLUMN IF NOT EXISTS avatar_selected_level BIGINT;
+    ADD COLUMN IF NOT EXISTS avatar_selected_level BIGINT,
+    ADD COLUMN IF NOT EXISTS frame_selected_level BIGINT;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_frame_unlocks(
+      user_id TEXT NOT NULL,
+      frame_level BIGINT NOT NULL,
+      unlocked_at BIGINT NOT NULL,
+      PRIMARY KEY(user_id, frame_level)
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS user_frame_unlocks_user_idx
+    ON user_frame_unlocks(user_id, frame_level);
+  `);
 
   /* =========================
      CHAT
@@ -371,6 +425,7 @@ async function initDb() {
       nick TEXT NOT NULL,
       xp BIGINT DEFAULT 0,
       avatar_level BIGINT,
+      frame_level BIGINT,
       is_guest BOOLEAN DEFAULT true,
       first_seen_at BIGINT NOT NULL,
       last_seen_at BIGINT NOT NULL
@@ -380,6 +435,11 @@ async function initDb() {
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS site_visitors_visitor_key_unique
     ON site_visitors(visitor_key);
+  `);
+
+  await pool.query(`
+    ALTER TABLE site_visitors
+    ADD COLUMN IF NOT EXISTS frame_level BIGINT;
   `);
 
   await pool.query(`
@@ -400,10 +460,16 @@ async function initDb() {
       xp BIGINT DEFAULT 0,
       level BIGINT DEFAULT 1,
       avatar_level BIGINT,
+      frame_level BIGINT,
       is_guest BOOLEAN DEFAULT true,
       message TEXT NOT NULL,
       created_at BIGINT NOT NULL
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE global_chat
+    ADD COLUMN IF NOT EXISTS frame_level BIGINT;
   `);
 
   await pool.query(`
@@ -420,7 +486,7 @@ async function initDb() {
 
 initDb()
   .then(() => {
-    console.log("✅ Banco OK");
+    console.log("✅ Banco OK - frames groundwork");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
     );
@@ -463,10 +529,18 @@ app.post("/api/register", async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const id = "u_" + Math.random().toString(36).slice(2, 10);
 
+    const now = Date.now();
     await pool.query(
       `INSERT INTO users(id,nick,password_hash,xp,created_at)
        VALUES($1,$2,$3,0,$4)`,
-      [id, nick, hash, Date.now()]
+      [id, nick, hash, now]
+    );
+
+    await pool.query(
+      `INSERT INTO user_frame_unlocks(user_id,frame_level,unlocked_at)
+       VALUES($1,1,$2)
+       ON CONFLICT (user_id, frame_level) DO NOTHING`,
+      [id, now]
     );
 
     res.json({ ok: true });
@@ -505,6 +579,15 @@ app.post("/api/login", async (req, res) => {
       { expiresIn: "30d" }
     );
 
+    await pool.query(
+      `INSERT INTO user_frame_unlocks(user_id,frame_level,unlocked_at)
+       VALUES($1,1,$2)
+       ON CONFLICT (user_id, frame_level) DO NOTHING`,
+      [user.id, Date.now()]
+    );
+
+    const unlockedFrameLevels = await getUnlockedFrameLevelsForUser(user.id);
+
     res.json({
       ok: true,
       token,
@@ -513,6 +596,8 @@ app.post("/api/login", async (req, res) => {
         nick: user.nick,
         xp: Number(user.xp || 0),
         avatar_selected_level: Number(user.avatar_selected_level || 0),
+        frame_selected_level: Number(user.frame_selected_level || 0),
+        unlocked_frame_levels: unlockedFrameLevels,
       }),
     });
 
@@ -527,14 +612,15 @@ app.post("/api/login", async (req, res) => {
 
 app.get("/api/me", auth, async (req, res) => {
   const r = await pool.query(
-    `SELECT id,nick,xp,avatar_selected_level FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT id,nick,xp,avatar_selected_level,frame_selected_level FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
   if (r.rowCount === 0)
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-  res.json({ ok: true, user: attachUserProgress(r.rows[0]) });
+  const unlockedFrameLevels = await getUnlockedFrameLevelsForUser(req.user.id);
+  res.json({ ok: true, user: attachUserProgress({ ...r.rows[0], unlocked_frame_levels: unlockedFrameLevels }) });
 });
 
 app.post("/api/avatar/select", auth, async (req, res) => {
@@ -546,7 +632,7 @@ app.post("/api/avatar/select", auth, async (req, res) => {
     }
 
     const r = await pool.query(
-      `SELECT id,nick,xp,avatar_selected_level FROM users WHERE id=$1 LIMIT 1`,
+      `SELECT id,nick,xp,avatar_selected_level,frame_selected_level FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
 
@@ -554,7 +640,8 @@ app.post("/api/avatar/select", auth, async (req, res) => {
       return res.status(404).json({ ok: false, error: "NOT_FOUND" });
     }
 
-    const current = attachUserProgress(r.rows[0]);
+    const unlockedFrameLevels = await getUnlockedFrameLevelsForUser(req.user.id);
+    const current = attachUserProgress({ ...r.rows[0], unlocked_frame_levels: unlockedFrameLevels });
     if (requestedLevel > current.avatar_level && requestedLevel > Math.min(15, current.level)) {
       return res.status(400).json({ ok: false, error: "AVATAR_LOCKED", need_level: requestedLevel });
     }
@@ -567,6 +654,7 @@ app.post("/api/avatar/select", auth, async (req, res) => {
     const updated = attachUserProgress({
       ...r.rows[0],
       avatar_selected_level: requestedLevel,
+      unlocked_frame_levels: unlockedFrameLevels,
     });
 
     res.json({ ok: true, user: updated, avatar: updated.avatar, avatar_level: updated.avatar_level });
@@ -575,6 +663,148 @@ app.post("/api/avatar/select", auth, async (req, res) => {
     res.status(500).json({ ok: false, error: "AVATAR_SELECT_FAIL" });
   }
 });
+
+app.get("/api/frames/me", auth, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id,nick,xp,avatar_selected_level,frame_selected_level FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (r.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    await pool.query(
+      `INSERT INTO user_frame_unlocks(user_id,frame_level,unlocked_at)
+       VALUES($1,1,$2)
+       ON CONFLICT (user_id, frame_level) DO NOTHING`,
+      [req.user.id, Date.now()]
+    );
+
+    const unlockedFrameLevels = await getUnlockedFrameLevelsForUser(req.user.id);
+    const user = attachUserProgress({ ...r.rows[0], unlocked_frame_levels: unlockedFrameLevels });
+    res.json({
+      ok: true,
+      unlocked_frame_levels: user.unlocked_frame_levels,
+      frame_selected_level: user.frame_selected_level,
+      frame_level: user.frame_level,
+      frame: user.frame,
+      user,
+    });
+  } catch (e) {
+    console.error("FRAMES_ME_FAIL:", e);
+    res.status(500).json({ ok: false, error: "FRAMES_ME_FAIL" });
+  }
+});
+
+app.post("/api/frames/select", auth, async (req, res) => {
+  try {
+    const requestedLevel = Number(req.body?.level || 0);
+    if (!Number.isFinite(requestedLevel) || requestedLevel < 1 || requestedLevel > MAX_FRAME_LEVEL) {
+      return res.status(400).json({ ok: false, error: "FRAME_LEVEL_INVALID" });
+    }
+
+    const unlockedFrameLevels = await getUnlockedFrameLevelsForUser(req.user.id);
+    if (!unlockedFrameLevels.includes(requestedLevel)) {
+      return res.status(400).json({ ok: false, error: "FRAME_LOCKED", need_frame: requestedLevel });
+    }
+
+    await pool.query(
+      `UPDATE users SET frame_selected_level=$1 WHERE id=$2`,
+      [requestedLevel, req.user.id]
+    );
+
+    const r = await pool.query(
+      `SELECT id,nick,xp,avatar_selected_level,frame_selected_level FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    const user = attachUserProgress({ ...r.rows[0], unlocked_frame_levels: unlockedFrameLevels });
+    res.json({ ok: true, user, frame_level: user.frame_level, frame: user.frame });
+  } catch (e) {
+    console.error("FRAME_SELECT_FAIL:", e);
+    res.status(500).json({ ok: false, error: "FRAME_SELECT_FAIL" });
+  }
+});
+
+app.post("/api/frames/sync", auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const levels = sanitizeUnlockedFrameLevels(req.body?.unlockedLevels || req.body?.levels || []);
+    await client.query("BEGIN");
+
+    for (const frameLevel of levels) {
+      await client.query(
+        `INSERT INTO user_frame_unlocks(user_id,frame_level,unlocked_at)
+         VALUES($1,$2,$3)
+         ON CONFLICT (user_id, frame_level) DO NOTHING`,
+        [req.user.id, frameLevel, Date.now()]
+      );
+    }
+
+    const userRow = await client.query(
+      `SELECT id,nick,xp,avatar_selected_level,frame_selected_level FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    const unlockedFrameLevels = sanitizeUnlockedFrameLevels((await client.query(
+      `SELECT frame_level FROM user_frame_unlocks WHERE user_id=$1 ORDER BY frame_level ASC`,
+      [req.user.id]
+    )).rows.map((row) => Number(row.frame_level || 0)));
+
+    const currentSelected = Number(userRow.rows[0]?.frame_selected_level || 0);
+    const safeSelected = unlockedFrameLevels.includes(currentSelected) ? currentSelected : unlockedFrameLevels[0] || 1;
+
+    if (safeSelected !== currentSelected) {
+      await client.query(`UPDATE users SET frame_selected_level=$1 WHERE id=$2`, [safeSelected, req.user.id]);
+    }
+
+    await client.query("COMMIT");
+
+    const user = attachUserProgress({
+      ...userRow.rows[0],
+      frame_selected_level: safeSelected,
+      unlocked_frame_levels: unlockedFrameLevels,
+    });
+
+    res.json({ ok: true, unlocked_frame_levels: unlockedFrameLevels, user, frame: user.frame, frame_level: user.frame_level });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("FRAMES_SYNC_FAIL:", e);
+    res.status(500).json({ ok: false, error: "FRAMES_SYNC_FAIL" });
+  } finally {
+    client.release();
+  }
+});
+
+app.post(
+  "/api/admin/frames/unlock",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const userId = (req.body?.userId || "").toString().trim();
+      const frameLevel = Number(req.body?.level || 0);
+      if (!userId) return res.status(400).json({ ok: false, error: "USER_ID_REQUIRED" });
+      if (!Number.isFinite(frameLevel) || frameLevel < 1 || frameLevel > MAX_FRAME_LEVEL) {
+        return res.status(400).json({ ok: false, error: "FRAME_LEVEL_INVALID" });
+      }
+
+      await pool.query(
+        `INSERT INTO user_frame_unlocks(user_id,frame_level,unlocked_at)
+         VALUES($1,$2,$3)
+         ON CONFLICT (user_id, frame_level) DO NOTHING`,
+        [userId, frameLevel, Date.now()]
+      );
+
+      res.json({ ok: true, userId, frameLevel, frame: getFrameFromLevel(frameLevel) });
+    } catch (e) {
+      console.error("ADMIN_FRAME_UNLOCK_FAIL:", e);
+      res.status(500).json({ ok: false, error: "ADMIN_FRAME_UNLOCK_FAIL" });
+    }
+  }
+);
 
 app.post("/api/add-xp", auth, async (req, res) => {
   const amount = Number(req.body?.amount || 0);
@@ -588,7 +818,7 @@ app.post("/api/add-xp", auth, async (req, res) => {
   );
 
   const r = await pool.query(
-    `SELECT id,nick,xp,avatar_selected_level FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT id,nick,xp,avatar_selected_level,frame_selected_level FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
@@ -599,6 +829,8 @@ app.post("/api/add-xp", auth, async (req, res) => {
     xp: user.xp,
     level: user.level,
     avatar: user.avatar,
+    frame: user.frame,
+    frame_level: user.frame_level,
     user,
   });
 });
@@ -1035,30 +1267,36 @@ app.post("/api/visitor", authOptional, async (req, res) => {
     let level = 1;
     let avatarLevel = 1;
     let avatar = getAvatarFromLevel(1);
+    let frameLevel = 1;
+    let frame = getFrameFromLevel(1);
 
     if (userId) {
-      const ur = await pool.query(`SELECT nick, xp, avatar_selected_level FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT nick, xp, avatar_selected_level, frame_selected_level FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const unlockedFrameLevels = await getUnlockedFrameLevelsForUser(userId);
       nick = ur.rows[0]?.nick || nick;
       xp = Number(ur.rows[0]?.xp || 0);
       level = getLevelFromXp(xp);
       avatarLevel = getEquippedAvatarLevel(level, ur.rows[0]?.avatar_selected_level);
       avatar = getAvatarFromLevel(avatarLevel);
+      frameLevel = getEquippedFrameLevel(unlockedFrameLevels, ur.rows[0]?.frame_selected_level);
+      frame = getFrameFromLevel(frameLevel);
     }
 
     await pool.query(
-      `INSERT INTO site_visitors(visitor_key,user_id,nick,xp,avatar_level,is_guest,first_seen_at,last_seen_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$7)
+      `INSERT INTO site_visitors(visitor_key,user_id,nick,xp,avatar_level,frame_level,is_guest,first_seen_at,last_seen_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)
        ON CONFLICT (visitor_key) DO UPDATE
        SET user_id = EXCLUDED.user_id,
            nick = EXCLUDED.nick,
            xp = EXCLUDED.xp,
            avatar_level = EXCLUDED.avatar_level,
+           frame_level = EXCLUDED.frame_level,
            is_guest = EXCLUDED.is_guest,
            last_seen_at = EXCLUDED.last_seen_at`,
-      [visitorKey, userId, nick, xp, avatarLevel, !userId, now]
+      [visitorKey, userId, nick, xp, avatarLevel, frameLevel, !userId, now]
     );
 
-    res.json({ ok: true, nick, xp, level, avatar });
+    res.json({ ok: true, nick, xp, level, avatar, frame, frame_level: frameLevel });
   } catch (e) {
     console.error("VISITOR_POST_FAIL:", e);
     res.status(500).json({ ok: false, error: "VISITOR_POST_FAIL" });
@@ -1071,7 +1309,7 @@ app.get("/api/visitors", async (req, res) => {
     const onlineMin = now - ONLINE_WINDOW_MS;
 
     const onlineR = await pool.query(
-      `SELECT nick, xp, avatar_level, is_guest, last_seen_at
+      `SELECT nick, xp, avatar_level, frame_level, is_guest, last_seen_at
        FROM site_visitors
        WHERE last_seen_at >= $1
        ORDER BY last_seen_at DESC
@@ -1080,7 +1318,7 @@ app.get("/api/visitors", async (req, res) => {
     );
 
     const lastSeenR = await pool.query(
-      `SELECT nick, xp, avatar_level, is_guest, last_seen_at
+      `SELECT nick, xp, avatar_level, frame_level, is_guest, last_seen_at
        FROM site_visitors
        WHERE last_seen_at < $1
        ORDER BY last_seen_at DESC
@@ -1101,6 +1339,8 @@ app.get("/api/visitors", async (req, res) => {
           level,
           avatar_level: isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level),
           avatar: getAvatarFromLevel(isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level)),
+          frame_level: isGuest ? 1 : getEquippedFrameLevel([1, Number(r.frame_level || 1)], r.frame_level),
+          frame: getFrameFromLevel(isGuest ? 1 : getEquippedFrameLevel([1, Number(r.frame_level || 1)], r.frame_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1115,6 +1355,8 @@ app.get("/api/visitors", async (req, res) => {
           level,
           avatar_level: isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level),
           avatar: getAvatarFromLevel(isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level)),
+          frame_level: isGuest ? 1 : getEquippedFrameLevel([1, Number(r.frame_level || 1)], r.frame_level),
+          frame: getFrameFromLevel(isGuest ? 1 : getEquippedFrameLevel([1, Number(r.frame_level || 1)], r.frame_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1134,7 +1376,7 @@ app.get("/api/visitors", async (req, res) => {
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT id, nick, xp, level, avatar_level, is_guest, message, created_at
+      SELECT id, nick, xp, level, avatar_level, frame_level, is_guest, message, created_at
       FROM global_chat
       ORDER BY created_at ASC
       LIMIT 100
@@ -1147,6 +1389,7 @@ app.get('/api/global-chat/messages', async (req, res) => {
         const isGuest = !!m.is_guest;
         const level = isGuest ? 1 : Math.max(1, Number(m.level || getLevelFromXp(xp)));
         const avatarLevel = isGuest ? 1 : getEquippedAvatarLevel(level, m.avatar_level);
+        const frameLevel = isGuest ? 1 : getEquippedFrameLevel([1, Number(m.frame_level || 1)], m.frame_level);
         const text = String(m.message || '');
         const deleted = text === 'Mensagem apagada pelo administrador';
         return {
@@ -1156,6 +1399,8 @@ app.get('/api/global-chat/messages', async (req, res) => {
           level,
           avatar_level: avatarLevel,
           avatar: getAvatarFromLevel(avatarLevel),
+          frame_level: frameLevel,
+          frame: getFrameFromLevel(frameLevel),
           is_guest: isGuest,
           message: text,
           deleted,
@@ -1196,14 +1441,17 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
     let xp = 0;
     let level = 1;
     let avatarLevel = 1;
+    let frameLevel = 1;
     let isGuest = !userId;
 
     if (userId) {
-      const ur = await pool.query(`SELECT nick, xp, avatar_selected_level FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT nick, xp, avatar_selected_level, frame_selected_level FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const unlockedFrameLevels = await getUnlockedFrameLevelsForUser(userId);
       nick = ur.rows[0]?.nick || nick || 'Usuário';
       xp = Number(ur.rows[0]?.xp || 0);
       level = getLevelFromXp(xp);
       avatarLevel = getEquippedAvatarLevel(level, ur.rows[0]?.avatar_selected_level);
+      frameLevel = getEquippedFrameLevel(unlockedFrameLevels, ur.rows[0]?.frame_selected_level);
     } else {
       const raw = senderKey.replace(/^guest:/, '');
       const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
@@ -1211,6 +1459,7 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       xp = 0;
       level = 1;
       avatarLevel = 1;
+      frameLevel = 1;
       isGuest = true;
     }
 
@@ -1230,6 +1479,8 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
         level,
         avatar_level: avatarLevel,
         avatar: getAvatarFromLevel(avatarLevel),
+        frame_level: frameLevel,
+        frame: getFrameFromLevel(frameLevel),
         is_guest: isGuest,
         message: text,
         created_at: now,
