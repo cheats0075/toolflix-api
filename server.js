@@ -138,6 +138,7 @@ function getVisitorKey(req) {
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
 const MAX_AVATAR_LEVEL = 15;
 const MAX_FRAME_LEVEL = 30;
+const STATIC_ASSET_BASE = "https://cheats0075.github.io/toolflix";
 
 
 function getLevelFromXp(rawXp) {
@@ -166,12 +167,12 @@ function getLevelFromXp(rawXp) {
 
 function getAvatarFromLevel(rawLevel) {
   const level = Math.max(1, Math.min(MAX_AVATAR_LEVEL, Number(rawLevel || 1)));
-  return `/assets/img/avatars/level-${level}.webp`;
+  return `${STATIC_ASSET_BASE}/assets/img/avatars/level-${level}.webp`;
 }
 
 function getFrameFromLevel(rawLevel) {
   const level = Math.max(1, Math.min(MAX_FRAME_LEVEL, Number(rawLevel || 1)));
-  return `/assets/img/molduras/avatar-${level}.png`;
+  return `${STATIC_ASSET_BASE}/assets/img/molduras/avatar-${level}.png`;
 }
 
 function sanitizeUnlockedFrameLevels(levels) {
@@ -486,7 +487,7 @@ async function initDb() {
 
 initDb()
   .then(() => {
-    console.log("✅ Banco OK - frames/chat/avatar js step 1");
+    console.log("✅ Banco OK - frames/chat/avatar final sync");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
     );
@@ -1465,9 +1466,9 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
 
     const msgId = 'gc_' + Math.random().toString(36).slice(2, 10);
     await pool.query(
-      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,avatar_level,frame_level,is_guest,message,created_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [msgId, senderKey, userId, nick, xp, level, avatarLevel, frameLevel, isGuest, text, now]
+      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,avatar_level,is_guest,message,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [msgId, senderKey, userId, nick, xp, level, avatarLevel, isGuest, text, now]
     );
 
     res.json({
