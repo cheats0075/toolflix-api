@@ -420,7 +420,7 @@ async function initDb() {
 
 initDb()
   .then(() => {
-    console.log("✅ Banco OK");
+    console.log("✅ Banco OK - visitors avatar fix");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
     );
@@ -1099,8 +1099,8 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar_level: item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level),
-          avatar: getAvatarFromLevel(item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level)),
+          avatar_level: isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level),
+          avatar: getAvatarFromLevel(isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1113,8 +1113,8 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar_level: item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level),
-          avatar: getAvatarFromLevel(item.is_guest ? 1 : getEquippedAvatarLevel(level, item.avatar_level)),
+          avatar_level: isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level),
+          avatar: getAvatarFromLevel(isGuest ? 1 : getEquippedAvatarLevel(level, r.avatar_level)),
           is_guest: isGuest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
