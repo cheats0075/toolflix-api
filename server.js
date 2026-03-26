@@ -215,11 +215,12 @@ async function initDb() {
     ALTER TABLE users
     ADD COLUMN IF NOT EXISTS downloads_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS favorites_count BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS themes_changed_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS theme_changes_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS youtube_rewards_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS achievements_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS last_login_at BIGINT;
   `);
+
 
   /* =========================
      CHAT
@@ -434,11 +435,10 @@ app.post("/api/register", async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const id = "u_" + Math.random().toString(36).slice(2, 10);
 
-    const now = Date.now();
     await pool.query(
-      `INSERT INTO users(id,nick,password_hash,xp,created_at,last_login_at)
-       VALUES($1,$2,$3,0,$4,$4)`,
-      [id, nick, hash, now]
+      `INSERT INTO users(id,nick,password_hash,xp,created_at)
+       VALUES($1,$2,$3,0,$4)`,
+      [id, nick, hash, Date.now()]
     );
 
     res.json({ ok: true });
@@ -494,75 +494,13 @@ app.post("/api/login", async (req, res) => {
     res.status(500).json({ ok: false, error: "LOGIN_FAIL" });
   }
 });
-
-app.get("/api/profile/:nick", async (req, res) => {
-  try {
-    const nick = (req.params?.nick || "").toString().trim();
-    if (!nick) return res.status(400).json({ ok:false, error:"NICK_REQUIRED" });
-
-    const r = await pool.query(
-      `SELECT id,nick,xp,created_at,premium,
-              downloads_count,favorites_count,themes_changed_count,
-              youtube_rewards_count,achievements_count,last_login_at
-         FROM users
-        WHERE LOWER(nick)=LOWER($1)
-        LIMIT 1`,
-      [nick]
-    );
-
-    if (r.rowCount === 0) return res.status(404).json({ ok:false, error:"NOT_FOUND" });
-
-    const u = r.rows[0];
-    const xp = Number(u.xp || 0);
-    const level = xpToLevel(xp);
-    const nextMap = {1:100,2:250,3:500,4:750,5:1250};
-    let nextXp = nextMap[level];
-    if (!nextXp) {
-      let lvl = 6, max = 1900;
-      while (lvl < level) {
-        lvl++;
-        max += 650 + (lvl - 7) * 150;
-      }
-      nextXp = max;
-    }
-    const prevXp = level <= 1 ? 0 : (level === 2 ? 100 : level === 3 ? 250 : level === 4 ? 500 : level === 5 ? 750 : 1250);
-    const progressPct = Math.max(0, Math.min(100, Math.round(((xp - prevXp) / Math.max(1, nextXp - prevXp)) * 100)));
-
-    return res.json({
-      ok: true,
-      profile: {
-        id: u.id,
-        nick: u.nick,
-        xp,
-        level,
-        avatar: levelToAvatar(level),
-        premium: !!u.premium,
-        master: u.nick === MASTER_NICK,
-        created_at: Number(u.created_at || 0),
-        last_login_at: Number(u.last_login_at || 0),
-        downloads: Number(u.downloads_count || 0),
-        favoritos: Number(u.favorites_count || 0),
-        temas: Number(u.themes_changed_count || 0),
-        youtube: Number(u.youtube_rewards_count || 0),
-        conquistas: Number(u.achievements_count || 0),
-        conquistas_total: 26,
-        next_xp: nextXp,
-        progress_pct: progressPct
-      }
-    });
-  } catch (e) {
-    console.error("PROFILE_FAIL:", e);
-    res.status(500).json({ ok:false, error:"PROFILE_FAIL" });
-  }
-});
-
 /* =========================
    USER + XP
 ========================= */
 
 app.get("/api/me", auth, async (req, res) => {
   const r = await pool.query(
-    `SELECT id,nick,xp,premium FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT id,nick,xp FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
@@ -571,7 +509,7 @@ app.get("/api/me", auth, async (req, res) => {
 
   const user = r.rows[0];
   const level = xpToLevel(user.xp);
-  res.json({ ok: true, user: { ...user, premium: !!user.premium, xp: Number(user.xp || 0), level, avatar: levelToAvatar(level) } });
+  res.json({ ok: true, user: { ...user, xp: Number(user.xp || 0), level, avatar: levelToAvatar(level) } });
 });
 
 app.post("/api/add-xp", auth, async (req, res) => {
@@ -807,6 +745,57 @@ app.post("/api/validar-token", async (req, res) => {
     client.release();
   }
 });
+
+
+app.get("/api/profile/:nick", async (req, res) => {
+  try {
+    await cleanupExpiredPremiumAccounts();
+    const nick = (req.params?.nick || "").toString().trim();
+    if (!nick) return res.status(400).json({ ok: false, error: "NICK_REQUIRED" });
+
+    const r = await pool.query(
+      `SELECT id,nick,xp,created_at,premium,premium_until,
+              downloads_count,favorites_count,theme_changes_count,
+              youtube_rewards_count,achievements_count,last_login_at
+         FROM users
+        WHERE LOWER(nick)=LOWER($1)
+        LIMIT 1`,
+      [nick]
+    );
+
+    if (r.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const user = r.rows[0];
+    const xp = Number(user.xp || 0);
+    const level = xpToLevel(xp);
+    const premium = !!(user.premium && (!user.premium_until || Number(user.premium_until) > Date.now()));
+
+    res.json({
+      ok: true,
+      profile: {
+        id: user.id,
+        nick: user.nick,
+        xp,
+        level,
+        avatar: `/toolflix/assets/img/avatars/${levelToAvatar(level)}`,
+        premium,
+        isMaster: user.nick === MASTER_NICK,
+        downloads: Number(user.downloads_count || 0),
+        favorites: Number(user.favorites_count || 0),
+        themeChanges: Number(user.theme_changes_count || 0),
+        youtubeRewards: Number(user.youtube_rewards_count || 0),
+        achievements: Number(user.achievements_count || 0),
+        createdAt: Number(user.created_at || 0),
+        lastLoginAt: Number(user.last_login_at || 0)
+      }
+    });
+  } catch (e) {
+    console.error("PROFILE_FETCH_FAIL:", e);
+    res.status(500).json({ ok: false, error: "PROFILE_FETCH_FAIL" });
+  }
+});
+
 
 app.get("/api/is-premium/:userId", async (req, res) => {
   try {
