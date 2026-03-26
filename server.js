@@ -180,6 +180,70 @@ function levelToAvatar(level) {
   return `level-${n}.webp`;
 }
 
+const PROFILE_ACHIEVEMENTS = [
+  { id: "yt_1", type: "youtube", need: 1 },
+  { id: "yt_5", type: "youtube", need: 5 },
+  { id: "yt_15", type: "youtube", need: 15 },
+  { id: "yt_30", type: "youtube", need: 30 },
+  { id: "yt_60", type: "youtube", need: 60 },
+  { id: "yt_120", type: "youtube", need: 120 },
+  { id: "dl_3", type: "downloads", need: 3 },
+  { id: "dl_10", type: "downloads", need: 10 },
+  { id: "dl_25", type: "downloads", need: 25 },
+  { id: "dl_50", type: "downloads", need: 50 },
+  { id: "dl_100", type: "downloads", need: 100 },
+  { id: "dl_200", type: "downloads", need: 200 },
+  { id: "fv_5", type: "favorites", need: 5 },
+  { id: "fv_15", type: "favorites", need: 15 },
+  { id: "fv_30", type: "favorites", need: 30 },
+  { id: "fv_60", type: "favorites", need: 60 },
+  { id: "fv_100", type: "favorites", need: 100 },
+  { id: "fv_200", type: "favorites", need: 200 },
+  { id: "th_1", type: "themes", need: 1 },
+  { id: "th_5", type: "themes", need: 5 },
+  { id: "th_15", type: "themes", need: 15 },
+  { id: "th_30", type: "themes", need: 30 },
+  { id: "th_60", type: "themes", need: 60 },
+  { id: "th_120", type: "themes", need: 120 },
+  { id: "pr_1", type: "premium", need: 1 },
+];
+
+function buildProfileStatsRow(row) {
+  const xp = Number(row?.xp || 0);
+  const level = xpToLevel(xp);
+  const counts = {
+    downloads: Number(row?.downloads_count || 0),
+    favorites: Number(row?.favorites_count || 0),
+    themes: Number(row?.themes_count || 0),
+    youtube: Number(row?.youtube_count || 0),
+    premium: row?.premium ? 1 : 0,
+  };
+
+  let unlocked = 0;
+  for (const ach of PROFILE_ACHIEVEMENTS) {
+    if (Number(counts[ach.type] || 0) >= Number(ach.need || 0)) unlocked++;
+  }
+  const platinum = unlocked === PROFILE_ACHIEVEMENTS.length && PROFILE_ACHIEVEMENTS.length > 0;
+
+  return {
+    id: row.id,
+    nick: row.nick,
+    xp,
+    level,
+    avatar: levelToAvatar(level),
+    premium: !!row.premium,
+    premiumUntil: row.premium_until ? Number(row.premium_until) : null,
+    createdAt: row.created_at ? Number(row.created_at) : null,
+    lastLoginAt: row.last_login_at ? Number(row.last_login_at) : null,
+    stats: counts,
+    achievements: {
+      unlockedCount: unlocked + (platinum ? 1 : 0),
+      totalCount: PROFILE_ACHIEVEMENTS.length + 1,
+      platinum,
+    }
+  };
+}
+
 /* =========================
    INIT DATABASE
 ========================= */
@@ -206,7 +270,12 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS premium_until BIGINT,
     ADD COLUMN IF NOT EXISTS premium_token_used TEXT,
     ADD COLUMN IF NOT EXISTS premium_removed_at BIGINT,
-    ADD COLUMN IF NOT EXISTS premium_removed_by TEXT;
+    ADD COLUMN IF NOT EXISTS premium_removed_by TEXT,
+    ADD COLUMN IF NOT EXISTS downloads_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS favorites_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS themes_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS youtube_count BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS last_login_at BIGINT;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
@@ -229,6 +298,17 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS last_activity_at BIGINT NOT NULL DEFAULT 0;
   `);
 
+  // backfill: se estiver 0, usa created_at ou última mensagem
+  await pool.query(`
+    UPDATE chats c
+    SET last_activity_at = COALESCE(
+      (SELECT MAX(created_at) FROM chat_messages m WHERE m.chat_id = c.id),
+      c.created_at
+    )
+    WHERE c.last_activity_at = 0
+  `);
+
+
   await pool.query(`
     CREATE INDEX IF NOT EXISTS chats_user_idx ON chats(user_id);
   `);
@@ -250,16 +330,6 @@ async function initDb() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS chat_messages_chat_idx 
     ON chat_messages(chat_id, created_at);
-  `);
-
-  // backfill: se estiver 0, usa created_at ou última mensagem
-  await pool.query(`
-    UPDATE chats c
-    SET last_activity_at = COALESCE(
-      (SELECT MAX(created_at) FROM chat_messages m WHERE m.chat_id = c.id),
-      c.created_at
-    )
-    WHERE c.last_activity_at = 0
   `);
 
   /* =========================
@@ -442,7 +512,7 @@ app.post("/api/login", async (req, res) => {
     const password = (req.body?.password || "").toString();
 
     const r = await pool.query(
-      `SELECT * FROM users WHERE LOWER(nick)=LOWER($1) LIMIT 1`,
+      `SELECT * FROM users WHERE nick=$1 LIMIT 1`,
       [nick]
     );
 
@@ -454,6 +524,11 @@ app.post("/api/login", async (req, res) => {
 
     if (!match)
       return res.status(401).json({ ok: false, error: "INVALID" });
+
+    await pool.query(
+      `UPDATE users SET last_login_at=$2 WHERE id=$1`,
+      [user.id, Date.now()]
+    );
 
     const token = jwt.sign(
       {
@@ -486,16 +561,17 @@ app.post("/api/login", async (req, res) => {
 
 app.get("/api/me", auth, async (req, res) => {
   const r = await pool.query(
-    `SELECT id,nick,xp FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+            downloads_count,favorites_count,themes_count,youtube_count
+       FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
   if (r.rowCount === 0)
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-  const user = r.rows[0];
-  const level = xpToLevel(user.xp);
-  res.json({ ok: true, user: { ...user, xp: Number(user.xp || 0), level, avatar: levelToAvatar(level) } });
+  const user = buildProfileStatsRow(r.rows[0]);
+  res.json({ ok: true, user });
 });
 
 app.post("/api/add-xp", auth, async (req, res) => {
@@ -517,6 +593,93 @@ app.post("/api/add-xp", auth, async (req, res) => {
   const xp = Number(r.rows[0]?.xp || 0);
   const level = xpToLevel(xp);
   res.json({ ok: true, xp, level, avatar: levelToAvatar(level) });
+});
+
+app.get("/api/profile/me", auth, async (req, res) => {
+  try {
+    await cleanupExpiredPremiumAccounts();
+    const r = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (r.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+  } catch (e) {
+    console.error("PROFILE_ME_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "PROFILE_ME_FAIL" });
+  }
+});
+
+app.get("/api/profile/:nick", async (req, res) => {
+  try {
+    await cleanupExpiredPremiumAccounts();
+    const nick = (req.params.nick || "").toString().trim();
+    const r = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count
+         FROM users
+         WHERE LOWER(nick)=LOWER($1)
+         LIMIT 1`,
+      [nick]
+    );
+
+    if (r.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+  } catch (e) {
+    console.error("PROFILE_PUBLIC_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "PROFILE_PUBLIC_FAIL" });
+  }
+});
+
+app.post("/api/profile/action", auth, async (req, res) => {
+  try {
+    const type = (req.body?.type || "").toString().trim().toLowerCase();
+    let amount = Number(req.body?.amount || 1);
+    if (!Number.isFinite(amount) || amount <= 0) amount = 1;
+    amount = Math.min(amount, 50);
+
+    const columnMap = {
+      download: "downloads_count",
+      downloads: "downloads_count",
+      favorite: "favorites_count",
+      favorites: "favorites_count",
+      theme: "themes_count",
+      themes: "themes_count",
+      youtube: "youtube_count",
+    };
+
+    const col = columnMap[type];
+    if (!col) {
+      return res.status(400).json({ ok: false, error: "ACTION_INVALID" });
+    }
+
+    await pool.query(
+      `UPDATE users SET ${col} = COALESCE(${col}, 0) + $1 WHERE id=$2`,
+      [amount, req.user.id]
+    );
+
+    const r = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (r.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+  } catch (e) {
+    console.error("PROFILE_ACTION_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "PROFILE_ACTION_FAIL" });
+  }
 });
 
 /* =========================
