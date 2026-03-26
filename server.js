@@ -233,6 +233,7 @@ function buildProfileStatsRow(row) {
     avatar: levelToAvatar(level),
     premium: !!row.premium,
     premiumUntil: row.premium_until ? Number(row.premium_until) : null,
+    passwordTemp: !!row.password_temp,
     createdAt: row.created_at ? Number(row.created_at) : null,
     lastLoginAt: row.last_login_at ? Number(row.last_login_at) : null,
     stats: counts,
@@ -275,7 +276,9 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS favorites_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS themes_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS youtube_count BIGINT NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS last_login_at BIGINT;
+    ADD COLUMN IF NOT EXISTS last_login_at BIGINT,
+    ADD COLUMN IF NOT EXISTS password_temp BOOLEAN NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS password_temp_set_at BIGINT;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
@@ -547,6 +550,7 @@ app.post("/api/login", async (req, res) => {
         id: user.id,
         nick: user.nick,
         xp: Number(user.xp || 0),
+        password_temp: !!user.password_temp,
       },
     });
 
@@ -562,7 +566,7 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/me", auth, async (req, res) => {
   const r = await pool.query(
     `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-            downloads_count,favorites_count,themes_count,youtube_count
+            downloads_count,favorites_count,themes_count,youtube_count,password_temp
        FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
@@ -600,7 +604,7 @@ app.get("/api/profile/me", auth, async (req, res) => {
     await cleanupExpiredPremiumAccounts();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -608,7 +612,9 @@ app.get("/api/profile/me", auth, async (req, res) => {
     if (r.rowCount === 0)
       return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+    const profile = buildProfileStatsRow(r.rows[0]);
+    delete profile.passwordTemp;
+    return res.json({ ok: true, profile });
   } catch (e) {
     console.error("PROFILE_ME_FAIL:", e);
     return res.status(500).json({ ok: false, error: "PROFILE_ME_FAIL" });
@@ -621,7 +627,7 @@ app.get("/api/profile/:nick", async (req, res) => {
     const nick = (req.params.nick || "").toString().trim();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp
          FROM users
          WHERE LOWER(nick)=LOWER($1)
          LIMIT 1`,
@@ -631,7 +637,9 @@ app.get("/api/profile/:nick", async (req, res) => {
     if (r.rowCount === 0)
       return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+    const profile = buildProfileStatsRow(r.rows[0]);
+    delete profile.passwordTemp;
+    return res.json({ ok: true, profile });
   } catch (e) {
     console.error("PROFILE_PUBLIC_FAIL:", e);
     return res.status(500).json({ ok: false, error: "PROFILE_PUBLIC_FAIL" });
@@ -667,7 +675,7 @@ app.post("/api/profile/action", auth, async (req, res) => {
 
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -681,6 +689,156 @@ app.post("/api/profile/action", auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "PROFILE_ACTION_FAIL" });
   }
 });
+
+app.post("/api/change-password", auth, async (req, res) => {
+  try {
+    const currentPassword = (req.body?.currentPassword || "").toString();
+    const newPassword = (req.body?.newPassword || "").toString();
+
+    if (!currentPassword) return res.status(400).json({ ok: false, error: "CURRENT_PASSWORD_REQUIRED" });
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ ok: false, error: "NEW_PASSWORD_MIN_6" });
+
+    const r = await pool.query(`SELECT id, password_hash FROM users WHERE id=$1 LIMIT 1`, [req.user.id]);
+    if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const user = r.rows[0];
+    const match = await bcrypt.compare(currentPassword, user.password_hash);
+    if (!match) return res.status(401).json({ ok: false, error: "CURRENT_PASSWORD_INVALID" });
+
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      `UPDATE users
+       SET password_hash=$2,
+           password_temp=false,
+           password_temp_set_at=NULL
+       WHERE id=$1`,
+      [req.user.id, hash]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("CHANGE_PASSWORD_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "CHANGE_PASSWORD_FAIL" });
+  }
+});
+
+app.post("/api/forgot-password-request", async (req, res) => {
+  try {
+    const nick = (req.body?.nick || "").toString().trim();
+    if (!nick) return res.status(400).json({ ok: false, error: "NICK_REQUIRED" });
+
+    const userR = await pool.query(
+      `SELECT id, nick FROM users WHERE LOWER(nick)=LOWER($1) LIMIT 1`,
+      [nick]
+    );
+    if (userR.rowCount === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const user = userR.rows[0];
+    const chat = await getOrCreateActiveChat(user.id);
+    const now = Date.now();
+    const recent = await pool.query(
+      `SELECT created_at FROM chat_messages
+       WHERE chat_id=$1 AND sender='user' AND message LIKE '🔐 RECUPERAR_SENHA:%'
+       ORDER BY created_at DESC LIMIT 1`,
+      [chat.id]
+    );
+    if (recent.rowCount > 0) {
+      const lastAt = Number(recent.rows[0].created_at || 0);
+      if (now - lastAt < 5 * 60 * 1000) {
+        return res.json({ ok: true, sent: false, waitMs: 5 * 60 * 1000 - (now - lastAt) });
+      }
+    }
+
+    const msgId = "m_" + Math.random().toString(36).slice(2, 10);
+    const text = `🔐 RECUPERAR_SENHA: ${user.nick}`;
+    await pool.query(
+      `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
+       VALUES($1,$2,'user',$3,$4)`,
+      [msgId, chat.id, text, now]
+    );
+    await pool.query(`UPDATE chats SET last_activity_at=$1 WHERE id=$2`, [now, chat.id]);
+
+    return res.json({ ok: true, sent: true, chatId: chat.id, nick: user.nick });
+  } catch (e) {
+    console.error("FORGOT_PASSWORD_REQUEST_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "FORGOT_PASSWORD_REQUEST_FAIL" });
+  }
+});
+
+app.get(
+  "/api/admin/find-user-by-nick",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const nick = (req.query?.nick || "").toString().trim();
+      if (!nick) return res.status(400).json({ ok: false, error: "NICK_REQUIRED" });
+
+      const r = await pool.query(
+        `SELECT id,nick,xp,premium,password_temp,created_at,last_login_at
+         FROM users
+         WHERE LOWER(nick)=LOWER($1)
+         LIMIT 1`,
+        [nick]
+      );
+      if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+      const row = r.rows[0];
+      return res.json({
+        ok: true,
+        user: {
+          id: row.id,
+          nick: row.nick,
+          xp: Number(row.xp || 0),
+          premium: !!row.premium,
+          password_temp: !!row.password_temp,
+          created_at: Number(row.created_at || 0),
+          last_login_at: Number(row.last_login_at || 0),
+        }
+      });
+    } catch (e) {
+      console.error("ADMIN_FIND_USER_FAIL:", e);
+      return res.status(500).json({ ok: false, error: "ADMIN_FIND_USER_FAIL" });
+    }
+  }
+);
+
+app.post(
+  "/api/admin/reset-password-temp",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const nick = (req.body?.nick || "").toString().trim();
+      let tempPassword = (req.body?.tempPassword || "").toString().trim();
+      if (!nick) return res.status(400).json({ ok: false, error: "NICK_REQUIRED" });
+
+      const r = await pool.query(`SELECT id,nick FROM users WHERE LOWER(nick)=LOWER($1) LIMIT 1`, [nick]);
+      if (r.rowCount === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+      const user = r.rows[0];
+
+      if (!tempPassword) {
+        const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+        tempPassword = Array.from({ length: 10 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+      }
+
+      const hash = await bcrypt.hash(tempPassword, 10);
+      await pool.query(
+        `UPDATE users
+         SET password_hash=$2,
+             password_temp=true,
+             password_temp_set_at=$3
+         WHERE id=$1`,
+        [user.id, hash, Date.now()]
+      );
+
+      return res.json({ ok: true, nick: user.nick, tempPassword });
+    } catch (e) {
+      console.error("ADMIN_RESET_PASSWORD_TEMP_FAIL:", e);
+      return res.status(500).json({ ok: false, error: "ADMIN_RESET_PASSWORD_TEMP_FAIL" });
+    }
+  }
+);
 
 /* =========================
    GAMES
