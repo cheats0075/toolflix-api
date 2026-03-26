@@ -229,17 +229,6 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS last_activity_at BIGINT NOT NULL DEFAULT 0;
   `);
 
-  // backfill: se estiver 0, usa created_at ou última mensagem
-  await pool.query(`
-    UPDATE chats c
-    SET last_activity_at = COALESCE(
-      (SELECT MAX(created_at) FROM chat_messages m WHERE m.chat_id = c.id),
-      c.created_at
-    )
-    WHERE c.last_activity_at = 0
-  `);
-
-
   await pool.query(`
     CREATE INDEX IF NOT EXISTS chats_user_idx ON chats(user_id);
   `);
@@ -261,6 +250,16 @@ async function initDb() {
   await pool.query(`
     CREATE INDEX IF NOT EXISTS chat_messages_chat_idx 
     ON chat_messages(chat_id, created_at);
+  `);
+
+  // backfill: se estiver 0, usa created_at ou última mensagem
+  await pool.query(`
+    UPDATE chats c
+    SET last_activity_at = COALESCE(
+      (SELECT MAX(created_at) FROM chat_messages m WHERE m.chat_id = c.id),
+      c.created_at
+    )
+    WHERE c.last_activity_at = 0
   `);
 
   /* =========================
@@ -443,7 +442,7 @@ app.post("/api/login", async (req, res) => {
     const password = (req.body?.password || "").toString();
 
     const r = await pool.query(
-      `SELECT * FROM users WHERE nick=$1 LIMIT 1`,
+      `SELECT * FROM users WHERE LOWER(nick)=LOWER($1) LIMIT 1`,
       [nick]
     );
 
