@@ -356,7 +356,6 @@ async function initDb() {
     ON games(link);
   `);
 
-
   await pool.query(`
     ALTER TABLE games
     ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '',
