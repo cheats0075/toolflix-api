@@ -356,6 +356,13 @@ async function initDb() {
     ON games(link);
   `);
 
+
+  await pool.query(`
+    ALTER TABLE games
+    ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '',
+    ADD COLUMN IF NOT EXISTS trailer_url TEXT DEFAULT '';
+  `);
+
   /* =========================
      TOKENS + PREMIUM
   ========================= */
@@ -965,6 +972,8 @@ app.post(
       const link = (body.link || "").toString().trim();
       const image = (body.image || "").toString().trim();
       const category = (body.category || "").toString().trim();
+      const description = (body.description || "").toString().trim();
+      const trailerUrl = (body.trailer_url || body.trailerUrl || body.trailer || "").toString().trim();
       const premium = !!body.premium;
 
       if (!title || !link)
@@ -977,15 +986,17 @@ app.post(
 
       await pool.query(
         `
-        INSERT INTO games(id,title,link,image,category,premium,created_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7)
+        INSERT INTO games(id,title,link,image,category,description,trailer_url,premium,created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
         ON CONFLICT (link) DO UPDATE
         SET title = EXCLUDED.title,
             image = EXCLUDED.image,
             category = EXCLUDED.category,
+            description = EXCLUDED.description,
+            trailer_url = EXCLUDED.trailer_url,
             premium = EXCLUDED.premium
         `,
-        [id, title, link, image, category, premium, Date.now()]
+        [id, title, link, image, category, description, trailerUrl, premium, Date.now()]
       );
 
       res.json({ ok: true });
