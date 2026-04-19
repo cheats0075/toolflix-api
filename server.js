@@ -584,19 +584,19 @@ async function initDb() {
 
 }
 
+// 🚀 INICIA O SERVIDOR PRIMEIRO (ESSENCIAL PRO RENDER)
+app.listen(PORT, () => {
+  console.log("ToolFlix API rodando na porta", PORT);
+});
+
+// 🔥 DEPOIS INICIALIZA BANCO E PS3
 initDb()
   .then(async () => {
     await importPs3GamesFromFile();
-    console.log("✅ Banco OK - avatar auto level fix");
-    app.listen(PORT, () =>
-      console.log("ToolFlix API rodando na porta", PORT)
-    );
+    console.log("✅ Banco e PS3 carregados");
   })
   .catch((e) => {
     console.error("❌ Erro initDb:", e);
-    app.listen(PORT, () =>
-      console.log("ToolFlix API (COM ERRO DB) na porta", PORT)
-    );
   });
 
 app.get("/", (req, res) =>
