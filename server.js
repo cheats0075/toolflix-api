@@ -1907,3 +1907,12 @@ app.post(
 );
 
 
+
+app.get("/api/ps3-debug", async (req, res) => {
+  try {
+    const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ps3_games`);
+    return res.json({ ok: true, route: true, total: Number(count.rows[0]?.total || 0), cwd: process.cwd(), dir: __dirname, hasTsv: fs.existsSync(path.join(__dirname, "PS3_GAMES.tsv")) || fs.existsSync(path.join(process.cwd(), "PS3_GAMES.tsv")) });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "PS3_DEBUG_FAIL", detail: String(e && e.message || e) });
+  }
+});
