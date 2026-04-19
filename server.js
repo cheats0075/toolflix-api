@@ -7,6 +7,8 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
@@ -245,6 +247,107 @@ function buildProfileStatsRow(row) {
   };
 }
 
+function parsePs3TsvFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    const raw = fs.readFileSync(filePath, "utf8");
+    const lines = raw.split(/\r?\n/).filter(Boolean);
+    if (lines.length <= 1) return [];
+
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split("\t");
+      if (!cols.length) continue;
+      const titleId = (cols[0] || "").trim();
+      const region = (cols[1] || "").trim();
+      const name = (cols[2] || "").trim();
+      const pkgLink = (cols[3] || "").trim();
+      const rap = (cols[4] || "").trim();
+      const contentId = (cols[5] || "").trim();
+      const modifiedAt = (cols[6] || "").trim();
+      const rapFile = (cols[7] || "").trim();
+      const fileSize = Number(cols[8] || 0) || 0;
+      const sha256 = (cols[9] || "").trim();
+      if (!titleId || !name) continue;
+      rows.push({ titleId, region, name, pkgLink, rap, contentId, modifiedAt, rapFile, fileSize, sha256 });
+    }
+    return rows;
+  } catch (e) {
+    console.error("PS3_TSV_PARSE_FAIL:", e);
+    return [];
+  }
+}
+
+function buildPs3Description(row) {
+  const parts = [
+    `Região: ${row.region || "N/D"}`,
+    `Title ID: ${row.titleId || "N/D"}`,
+    row.contentId ? `Content ID: ${row.contentId}` : "",
+    row.fileSize ? `Tamanho: ${row.fileSize} bytes` : "",
+    row.modifiedAt ? `Última modificação: ${row.modifiedAt}` : "",
+    row.rap && row.rap !== "MISSING" ? `RAP: ${row.rap}` : "",
+    row.sha256 ? `SHA256: ${row.sha256}` : ""
+  ].filter(Boolean);
+  return parts.join(" • ");
+}
+
+async function importPs3GamesFromFile() {
+  try {
+    const candidates = [
+      path.join(__dirname, "PS3_GAMES.tsv"),
+      path.join(process.cwd(), "PS3_GAMES.tsv"),
+      "/mnt/data/PS3_GAMES.tsv"
+    ];
+    const filePath = candidates.find((candidate) => fs.existsSync(candidate));
+    if (!filePath) {
+      console.warn("PS3_TSV_NOT_FOUND");
+      return;
+    }
+
+    const rows = parsePs3TsvFile(filePath);
+    if (!rows.length) {
+      console.warn("PS3_TSV_EMPTY");
+      return;
+    }
+
+    for (const row of rows) {
+      const id = `ps3_${row.titleId.toLowerCase()}`;
+      const safeLink = row.pkgLink && row.pkgLink !== "MISSING" ? row.pkgLink : "";
+      const image = `https://via.placeholder.com/512x512.png?text=${encodeURIComponent(row.titleId)}`;
+      await pool.query(
+        `
+        INSERT INTO ps3_games(
+          id, title_id, region, title, pkg_link, rap, content_id, last_modification_date,
+          rap_file_link, file_size, sha256, image, description, created_at, updated_at
+        )
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        ON CONFLICT (title_id) DO UPDATE
+        SET region = EXCLUDED.region,
+            title = EXCLUDED.title,
+            pkg_link = EXCLUDED.pkg_link,
+            rap = EXCLUDED.rap,
+            content_id = EXCLUDED.content_id,
+            last_modification_date = EXCLUDED.last_modification_date,
+            rap_file_link = EXCLUDED.rap_file_link,
+            file_size = EXCLUDED.file_size,
+            sha256 = EXCLUDED.sha256,
+            image = EXCLUDED.image,
+            description = EXCLUDED.description,
+            updated_at = EXCLUDED.updated_at
+        `,
+        [
+          id, row.titleId, row.region, row.name, safeLink, row.rap, row.contentId, row.modifiedAt,
+          row.rapFile, row.fileSize, row.sha256, image, buildPs3Description(row), Date.now(), Date.now()
+        ]
+      );
+    }
+
+    console.log(`✅ PS3 games importados: ${rows.length}`);
+  } catch (e) {
+    console.error("PS3_IMPORT_FAIL:", e);
+  }
+}
+
 /* =========================
    INIT DATABASE
 ========================= */
@@ -363,6 +466,29 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS trailer_url TEXT DEFAULT '';
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ps3_games(
+      id TEXT PRIMARY KEY,
+      title_id TEXT UNIQUE NOT NULL,
+      region TEXT DEFAULT '',
+      title TEXT NOT NULL,
+      pkg_link TEXT DEFAULT '',
+      rap TEXT DEFAULT '',
+      content_id TEXT DEFAULT '',
+      last_modification_date TEXT DEFAULT '',
+      rap_file_link TEXT DEFAULT '',
+      file_size BIGINT DEFAULT 0,
+      sha256 TEXT DEFAULT '',
+      image TEXT DEFAULT '',
+      description TEXT DEFAULT '',
+      created_at BIGINT NOT NULL,
+      updated_at BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS ps3_games_title_idx ON ps3_games(title);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS ps3_games_region_idx ON ps3_games(region);`);
+
   /* =========================
      TOKENS + PREMIUM
   ========================= */
@@ -459,7 +585,8 @@ async function initDb() {
 }
 
 initDb()
-  .then(() => {
+  .then(async () => {
+    await importPs3GamesFromFile();
     console.log("✅ Banco OK - avatar auto level fix");
     app.listen(PORT, () =>
       console.log("ToolFlix API rodando na porta", PORT)
@@ -939,6 +1066,59 @@ app.get("/api/games", async (req, res) => {
   } catch (e) {
     console.error("GAMES_GET_FAIL:", e);
     res.status(500).json({ ok: false, error: "GAMES_GET_FAIL" });
+  }
+});
+
+app.get("/api/ps3-games", async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query?.page || 1) || 1);
+    const limit = Math.min(50, Math.max(1, Number(req.query?.limit || 24) || 24));
+    const offset = (page - 1) * limit;
+    const search = (req.query?.search || "").toString().trim().toLowerCase();
+
+    const params = [];
+    let where = "";
+    if (search) {
+      params.push(`%${search}%`);
+      where = `WHERE LOWER(title) LIKE $${params.length} OR LOWER(title_id) LIKE $${params.length}`;
+    }
+
+    const totalQuery = `SELECT COUNT(*)::int AS total FROM ps3_games ${where}`;
+    const totalResult = await pool.query(totalQuery, params);
+    const total = Number(totalResult.rows[0]?.total || 0);
+
+    params.push(limit);
+    params.push(offset);
+
+    const dataQuery = `
+      SELECT title_id, region, title, pkg_link, rap, content_id, last_modification_date,
+             rap_file_link, file_size, sha256, image, description, created_at, updated_at
+      FROM ps3_games
+      ${where}
+      ORDER BY title ASC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `;
+
+    const r = await pool.query(dataQuery, params);
+    const games = r.rows.map((row) => ({
+      title: row.title,
+      category: "PAINEL PS3",
+      link: row.pkg_link,
+      image: row.image,
+      description: row.description,
+      trailer_url: "",
+      premium: false,
+      created_at: Number(row.updated_at || row.created_at || 0),
+      title_id: row.title_id,
+      region: row.region,
+      file_size: Number(row.file_size || 0),
+      sha256: row.sha256 || ""
+    }));
+
+    res.json({ ok: true, games, total, page, limit, hasMore: offset + games.length < total });
+  } catch (e) {
+    console.error("PS3_GAMES_GET_FAIL:", e);
+    res.status(500).json({ ok: false, error: "PS3_GAMES_GET_FAIL" });
   }
 });
 
