@@ -182,6 +182,15 @@ function levelToAvatar(level) {
   return `level-${n}.webp`;
 }
 
+function normalizeAvatarFilename(raw, fallbackLevel = 1) {
+  const clean = (raw || "").toString().trim();
+  if (/^level-(\d+)\.webp$/i.test(clean)) {
+    const n = Math.max(1, Math.min(15, Number(clean.match(/^level-(\d+)\.webp$/i)?.[1] || fallbackLevel || 1)));
+    return `level-${n}.webp`;
+  }
+  return levelToAvatar(fallbackLevel);
+}
+
 const PROFILE_ACHIEVEMENTS = [
   { id: "yt_1", type: "youtube", need: 1 },
   { id: "yt_5", type: "youtube", need: 5 },
@@ -232,7 +241,7 @@ function buildProfileStatsRow(row) {
     nick: row.nick,
     xp,
     level,
-    avatar: levelToAvatar(level),
+    avatar: normalizeAvatarFilename(row?.avatar, level),
     premium: !!row.premium,
     premiumUntil: row.premium_until ? Number(row.premium_until) : null,
     passwordTemp: !!row.password_temp,
@@ -381,7 +390,8 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS youtube_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS last_login_at BIGINT,
     ADD COLUMN IF NOT EXISTS password_temp BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS password_temp_set_at BIGINT;
+    ADD COLUMN IF NOT EXISTS password_temp_set_at BIGINT,
+    ADD COLUMN IF NOT EXISTS avatar TEXT;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
@@ -538,10 +548,16 @@ async function initDb() {
       user_id TEXT,
       nick TEXT NOT NULL,
       xp BIGINT DEFAULT 0,
+      avatar TEXT,
       is_guest BOOLEAN DEFAULT true,
       first_seen_at BIGINT NOT NULL,
       last_seen_at BIGINT NOT NULL
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE site_visitors
+    ADD COLUMN IF NOT EXISTS avatar TEXT;
   `);
 
   await pool.query(`
@@ -566,10 +582,16 @@ async function initDb() {
       nick TEXT NOT NULL,
       xp BIGINT DEFAULT 0,
       level BIGINT DEFAULT 1,
+      avatar TEXT,
       is_guest BOOLEAN DEFAULT true,
       message TEXT NOT NULL,
       created_at BIGINT NOT NULL
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE global_chat
+    ADD COLUMN IF NOT EXISTS avatar TEXT;
   `);
 
   await pool.query(`
@@ -684,6 +706,7 @@ app.post("/api/login", async (req, res) => {
         id: user.id,
         nick: user.nick,
         xp: Number(user.xp || 0),
+        avatar: normalizeAvatarFilename(user.avatar, xpToLevel(Number(user.xp || 0))),
         password_temp: !!user.password_temp,
       },
     });
@@ -700,7 +723,7 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/me", auth, async (req, res) => {
   const r = await pool.query(
     `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-            downloads_count,favorites_count,themes_count,youtube_count,password_temp
+            downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
        FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
@@ -724,13 +747,13 @@ app.post("/api/add-xp", auth, async (req, res) => {
   );
 
   const r = await pool.query(
-    `SELECT xp FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT xp, avatar FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
   const xp = Number(r.rows[0]?.xp || 0);
   const level = xpToLevel(xp);
-  res.json({ ok: true, xp, level, avatar: levelToAvatar(level) });
+  res.json({ ok: true, xp, level, avatar: normalizeAvatarFilename(r.rows[0]?.avatar, level) });
 });
 
 app.get("/api/profile/me", auth, async (req, res) => {
@@ -738,7 +761,7 @@ app.get("/api/profile/me", auth, async (req, res) => {
     await cleanupExpiredPremiumAccounts();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -761,7 +784,7 @@ app.get("/api/profile/:nick", async (req, res) => {
     const nick = (req.params.nick || "").toString().trim();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
          FROM users
          WHERE LOWER(nick)=LOWER($1)
          LIMIT 1`,
@@ -777,6 +800,44 @@ app.get("/api/profile/:nick", async (req, res) => {
   } catch (e) {
     console.error("PROFILE_PUBLIC_FAIL:", e);
     return res.status(500).json({ ok: false, error: "PROFILE_PUBLIC_FAIL" });
+  }
+});
+
+app.post("/api/profile/avatar", auth, async (req, res) => {
+  try {
+    const avatar = normalizeAvatarFilename(req.body?.avatar, 1);
+    const requestedLevel = Number((avatar.match(/^level-(\d+)\.webp$/i) || [])[1] || 1);
+
+    const userR = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (userR.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const user = userR.rows[0];
+    const level = xpToLevel(Number(user.xp || 0));
+
+    if (requestedLevel > level) {
+      return res.status(403).json({ ok: false, error: "AVATAR_LOCKED", needLevel: requestedLevel, currentLevel: level });
+    }
+
+    await pool.query(`UPDATE users SET avatar=$2 WHERE id=$1`, [req.user.id, avatar]);
+
+    const r = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+  } catch (e) {
+    console.error("PROFILE_AVATAR_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "PROFILE_AVATAR_FAIL" });
   }
 });
 
@@ -809,7 +870,7 @@ app.post("/api/profile/action", auth, async (req, res) => {
 
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -1539,21 +1600,24 @@ app.post("/api/visitor", authOptional, async (req, res) => {
     const userId = req.user?.id || null;
 
     let xp = 0;
+    let avatar = levelToAvatar(1);
     if (userId) {
-      const ur = await pool.query(`SELECT xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT xp, avatar FROM users WHERE id=$1 LIMIT 1`, [userId]);
       xp = Number(ur.rows[0]?.xp || 0);
+      avatar = normalizeAvatarFilename(ur.rows[0]?.avatar, xpToLevel(xp));
     }
 
     await pool.query(
-      `INSERT INTO site_visitors(visitor_key,user_id,nick,xp,is_guest,first_seen_at,last_seen_at)
-       VALUES($1,$2,$3,$4,$5,$6,$6)
+      `INSERT INTO site_visitors(visitor_key,user_id,nick,xp,avatar,is_guest,first_seen_at,last_seen_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$7)
        ON CONFLICT (visitor_key) DO UPDATE
        SET user_id = EXCLUDED.user_id,
            nick = EXCLUDED.nick,
            xp = EXCLUDED.xp,
+           avatar = EXCLUDED.avatar,
            is_guest = EXCLUDED.is_guest,
            last_seen_at = EXCLUDED.last_seen_at`,
-      [visitorKey, userId, nick, xp, !userId, now]
+      [visitorKey, userId, nick, xp, avatar, !userId, now]
     );
 
     res.json({ ok: true });
@@ -1569,7 +1633,7 @@ app.get("/api/visitors", async (req, res) => {
     const onlineMin = now - ONLINE_WINDOW_MS;
 
     const onlineR = await pool.query(
-      `SELECT nick, xp, is_guest, last_seen_at
+      `SELECT nick, xp, avatar, is_guest, last_seen_at
        FROM site_visitors
        WHERE last_seen_at >= $1
        ORDER BY last_seen_at DESC
@@ -1578,7 +1642,7 @@ app.get("/api/visitors", async (req, res) => {
     );
 
     const lastSeenR = await pool.query(
-      `SELECT nick, xp, is_guest, last_seen_at
+      `SELECT nick, xp, avatar, is_guest, last_seen_at
        FROM site_visitors
        WHERE last_seen_at < $1
        ORDER BY last_seen_at DESC
@@ -1596,7 +1660,7 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar: levelToAvatar(level),
+          avatar: normalizeAvatarFilename(r.avatar, level),
           is_guest: !!r.is_guest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1608,7 +1672,7 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar: levelToAvatar(level),
+          avatar: normalizeAvatarFilename(r.avatar, level),
           is_guest: !!r.is_guest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1628,7 +1692,7 @@ app.get("/api/visitors", async (req, res) => {
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT nick, xp, level, is_guest, message, created_at
+      SELECT nick, xp, level, avatar, is_guest, message, created_at
       FROM global_chat
       ORDER BY created_at ASC
       LIMIT 100
@@ -1642,7 +1706,7 @@ app.get('/api/global-chat/messages', async (req, res) => {
           nick: m.nick,
           xp: Number(m.xp || 0),
           level,
-          avatar: levelToAvatar(level),
+          avatar: normalizeAvatarFilename(m.avatar, level),
           is_guest: !!m.is_guest,
           message: m.message,
           created_at: Number(m.created_at || 0)
@@ -1681,27 +1745,30 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
     let userId = req.user?.id || null;
     let xp = 0;
     let level = 1;
+    let avatar = levelToAvatar(1);
     let isGuest = !userId;
 
     if (userId) {
-      const ur = await pool.query(`SELECT nick, xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT nick, xp, avatar FROM users WHERE id=$1 LIMIT 1`, [userId]);
       nick = ur.rows[0]?.nick || nick || 'Usuário';
       xp = Number(ur.rows[0]?.xp || 0);
       level = xpToLevel(xp);
+      avatar = normalizeAvatarFilename(ur.rows[0]?.avatar, level);
     } else {
       const raw = senderKey.replace(/^guest:/, '');
       const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
       nick = `Usuário ${suffix}`;
       xp = 0;
       level = 1;
+      avatar = levelToAvatar(1);
       isGuest = true;
     }
 
     const msgId = 'gc_' + Math.random().toString(36).slice(2, 10);
     await pool.query(
-      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,is_guest,message,created_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [msgId, senderKey, userId, nick, xp, level, isGuest, text, now]
+      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,avatar,is_guest,message,created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [msgId, senderKey, userId, nick, xp, level, avatar, isGuest, text, now]
     );
 
     res.json({ ok: true });
