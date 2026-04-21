@@ -182,6 +182,15 @@ function levelToAvatar(level) {
   return `level-${n}.webp`;
 }
 
+function normalizeAvatarFilename(raw, levelFallback = 1) {
+  const clean = String(raw || "").trim().toLowerCase();
+  if (/^level-(\d+)\.webp$/i.test(clean)) {
+    const n = Math.max(1, Math.min(15, Number((clean.match(/^level-(\d+)\.webp$/i) || [])[1] || 1)));
+    return `level-${n}.webp`;
+  }
+  return levelToAvatar(levelFallback);
+}
+
 const PROFILE_ACHIEVEMENTS = [
   { id: "yt_1", type: "youtube", need: 1 },
   { id: "yt_5", type: "youtube", need: 5 },
@@ -232,7 +241,7 @@ function buildProfileStatsRow(row) {
     nick: row.nick,
     xp,
     level,
-    avatar: levelToAvatar(level),
+    avatar: normalizeAvatarFilename(row?.avatar, level),
     premium: !!row.premium,
     premiumUntil: row.premium_until ? Number(row.premium_until) : null,
     passwordTemp: !!row.password_temp,
@@ -381,7 +390,8 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS youtube_count BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS last_login_at BIGINT,
     ADD COLUMN IF NOT EXISTS password_temp BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS password_temp_set_at BIGINT;
+    ADD COLUMN IF NOT EXISTS password_temp_set_at BIGINT,
+    ADD COLUMN IF NOT EXISTS avatar TEXT;
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
@@ -684,6 +694,7 @@ app.post("/api/login", async (req, res) => {
         id: user.id,
         nick: user.nick,
         xp: Number(user.xp || 0),
+        avatar: normalizeAvatarFilename(user.avatar, xpToLevel(Number(user.xp || 0))),
         password_temp: !!user.password_temp,
       },
     });
@@ -700,7 +711,7 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/me", auth, async (req, res) => {
   const r = await pool.query(
     `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-            downloads_count,favorites_count,themes_count,youtube_count,password_temp
+            downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
        FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
@@ -724,13 +735,13 @@ app.post("/api/add-xp", auth, async (req, res) => {
   );
 
   const r = await pool.query(
-    `SELECT xp FROM users WHERE id=$1 LIMIT 1`,
+    `SELECT xp, avatar FROM users WHERE id=$1 LIMIT 1`,
     [req.user.id]
   );
 
   const xp = Number(r.rows[0]?.xp || 0);
   const level = xpToLevel(xp);
-  res.json({ ok: true, xp, level, avatar: levelToAvatar(level) });
+  res.json({ ok: true, xp, level, avatar: normalizeAvatarFilename(r.rows[0]?.avatar, level) });
 });
 
 app.get("/api/profile/me", auth, async (req, res) => {
@@ -738,7 +749,7 @@ app.get("/api/profile/me", auth, async (req, res) => {
     await cleanupExpiredPremiumAccounts();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -761,7 +772,7 @@ app.get("/api/profile/:nick", async (req, res) => {
     const nick = (req.params.nick || "").toString().trim();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
          FROM users
          WHERE LOWER(nick)=LOWER($1)
          LIMIT 1`,
@@ -777,6 +788,44 @@ app.get("/api/profile/:nick", async (req, res) => {
   } catch (e) {
     console.error("PROFILE_PUBLIC_FAIL:", e);
     return res.status(500).json({ ok: false, error: "PROFILE_PUBLIC_FAIL" });
+  }
+});
+
+app.post("/api/profile/avatar", auth, async (req, res) => {
+  try {
+    const avatar = normalizeAvatarFilename(req.body?.avatar, 1);
+    const requestedLevel = Number((avatar.match(/^level-(\d+)\.webp$/i) || [])[1] || 1);
+
+    const userR = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (userR.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const user = userR.rows[0];
+    const level = xpToLevel(Number(user.xp || 0));
+
+    if (requestedLevel > level) {
+      return res.status(403).json({ ok: false, error: "AVATAR_LOCKED", needLevel: requestedLevel, currentLevel: level });
+    }
+
+    await pool.query(`UPDATE users SET avatar=$2 WHERE id=$1`, [req.user.id, avatar]);
+
+    const r = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+  } catch (e) {
+    console.error("PROFILE_AVATAR_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "PROFILE_AVATAR_FAIL" });
   }
 });
 
@@ -809,7 +858,7 @@ app.post("/api/profile/action", auth, async (req, res) => {
 
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
