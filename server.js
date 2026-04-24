@@ -186,7 +186,6 @@ function levelToAvatar(level, slot = 1) {
 function normalizeAvatarFilename(raw, levelFallback = 1) {
   const clean = String(raw || "").trim().toLowerCase();
 
-  // Novo padrão: 3 avatares por nível
   const multi = clean.match(/^level-(\d+)-([1-3])\.webp$/i);
   if (multi) {
     const n = Math.max(1, Math.min(15, Number(multi[1] || 1)));
@@ -194,7 +193,6 @@ function normalizeAvatarFilename(raw, levelFallback = 1) {
     return `level-${n}-${s}.webp`;
   }
 
-  // Compatibilidade com padrão antigo
   const old = clean.match(/^level-(\d+)(?:-([1-3]))?\.webp$/i);
   if (old) {
     const n = Math.max(1, Math.min(15, Number(old[1] || 1)));
