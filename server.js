@@ -177,18 +177,31 @@ function xpToLevel(xp) {
   return level;
 }
 
-function levelToAvatar(level) {
+function levelToAvatar(level, slot = 1) {
   const n = Math.max(1, Math.min(15, Number(level || 1)));
-  return `level-${n}.webp`;
+  const s = Math.max(1, Math.min(3, Number(slot || 1)));
+  return `level-${n}-${s}.webp`;
 }
 
 function normalizeAvatarFilename(raw, levelFallback = 1) {
   const clean = String(raw || "").trim().toLowerCase();
-  if (/^level-(\d+)\.webp$/i.test(clean)) {
-    const n = Math.max(1, Math.min(15, Number((clean.match(/^level-(\d+)\.webp$/i) || [])[1] || 1)));
-    return `level-${n}.webp`;
+
+  // Novo padrão: 3 avatares por nível
+  const multi = clean.match(/^level-(\d+)-([1-3])\.webp$/i);
+  if (multi) {
+    const n = Math.max(1, Math.min(15, Number(multi[1] || 1)));
+    const s = Math.max(1, Math.min(3, Number(multi[2] || 1)));
+    return `level-${n}-${s}.webp`;
   }
-  return levelToAvatar(levelFallback);
+
+  // Compatibilidade com padrão antigo
+  const old = clean.match(/^level-(\d+)(?:-([1-3]))?\.webp$/i);
+  if (old) {
+    const n = Math.max(1, Math.min(15, Number(old[1] || 1)));
+    return `level-${n}-1.webp`;
+  }
+
+  return levelToAvatar(levelFallback, 1);
 }
 
 const PROFILE_ACHIEVEMENTS = [
@@ -794,7 +807,7 @@ app.get("/api/profile/:nick", async (req, res) => {
 app.post("/api/profile/avatar", auth, async (req, res) => {
   try {
     const avatar = normalizeAvatarFilename(req.body?.avatar, 1);
-    const requestedLevel = Number((avatar.match(/^level-(\d+)\.webp$/i) || [])[1] || 1);
+    const requestedLevel = Number((avatar.match(/^level-(\d+)(?:-([1-3]))?\.webp$/i) || [])[1] || 1);
 
     const userR = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
