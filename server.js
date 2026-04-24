@@ -1908,6 +1908,58 @@ app.post(
   }
 );
 
+
+app.post(
+  "/api/admin/chats/open-by-nick",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      if (req.user?.nick !== MASTER_NICK) {
+        return res.status(403).json({ ok: false, error: "MASTER_ONLY" });
+      }
+
+      const nick = (req.body?.nick || "").toString().trim();
+      if (!nick) return res.status(400).json({ ok: false, error: "NICK_REQUIRED" });
+
+      const userResult = await pool.query(
+        `SELECT id, nick FROM users WHERE LOWER(nick)=LOWER($1) LIMIT 1`,
+        [nick]
+      );
+
+      if (userResult.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
+      }
+
+      const user = userResult.rows[0];
+      if (user.nick === MASTER_NICK) {
+        return res.status(400).json({ ok: false, error: "CANNOT_CHAT_SELF" });
+      }
+
+      const chat = await getOrCreateActiveChat(user.id);
+
+      await pool.query(
+        `UPDATE chats SET last_activity_at=$1 WHERE id=$2`,
+        [Date.now(), chat.id]
+      );
+
+      return res.json({
+        ok: true,
+        chat: {
+          id: chat.id,
+          user_id: user.id,
+          nick: user.nick,
+          expires_at: chat.expires_at
+        }
+      });
+    } catch (e) {
+      console.error("OPEN_CHAT_BY_NICK_FAIL:", e);
+      return res.status(500).json({ ok: false, error: "OPEN_CHAT_BY_NICK_FAIL" });
+    }
+  }
+);
+
+
 app.get(
   "/api/admin/chats",
   authOptional,
