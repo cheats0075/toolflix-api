@@ -1549,6 +1549,43 @@ app.post(
   }
 );
 
+
+/* =========================
+   SITE STATS (HOME)
+========================= */
+
+app.get("/api/site-stats", async (req, res) => {
+  try {
+    const users = await pool.query(`
+      SELECT
+        COALESCE(SUM(downloads_count),0)::bigint AS downloads,
+        COALESCE(SUM(favorites_count),0)::bigint AS favorites,
+        COALESCE(SUM(themes_count),0)::bigint AS themes,
+        COALESCE(SUM(youtube_count),0)::bigint AS youtube
+      FROM users
+    `);
+
+    const games = await pool.query(`SELECT COUNT(*)::int AS total FROM games`);
+    const visits = await pool.query(`SELECT value::bigint AS count FROM site_stats WHERE key='visits' LIMIT 1`);
+
+    const row = users.rows[0] || {};
+    res.json({
+      ok: true,
+      stats: {
+        downloads: Number(row.downloads || 0),
+        favorites: Number(row.favorites || 0),
+        themes: Number(row.themes || 0),
+        youtube: Number(row.youtube || 0),
+        games: Number(games.rows[0]?.total || 0),
+        visits: Number(visits.rows[0]?.count || 0)
+      }
+    });
+  } catch (e) {
+    console.error("SITE_STATS_FAIL:", e);
+    res.status(500).json({ ok: false, error: "SITE_STATS_FAIL" });
+  }
+});
+
 /* =========================
    VISITAS (CONTADOR REAL)
 ========================= */
