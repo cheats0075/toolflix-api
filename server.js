@@ -1725,7 +1725,7 @@ app.get("/api/visitors", async (req, res) => {
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT nick, xp, level, is_guest, message, created_at
+      SELECT id, nick, xp, level, is_guest, message, created_at
       FROM global_chat
       ORDER BY created_at ASC
       LIMIT 100
@@ -1736,6 +1736,7 @@ app.get('/api/global-chat/messages', async (req, res) => {
       messages: r.rows.map(m => {
         const level = Number(m.level || 1);
         return {
+          id: m.id,
           nick: m.nick,
           xp: Number(m.xp || 0),
           level,
