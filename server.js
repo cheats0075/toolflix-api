@@ -484,7 +484,8 @@ async function initDb() {
   await pool.query(`
     ALTER TABLE games
     ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '',
-    ADD COLUMN IF NOT EXISTS trailer_url TEXT DEFAULT '';
+    ADD COLUMN IF NOT EXISTS trailer_url TEXT DEFAULT '',
+    ADD COLUMN IF NOT EXISTS downloads BIGINT NOT NULL DEFAULT 0;
   `);
 
   await pool.query(`
@@ -1172,7 +1173,8 @@ app.get("/api/ps3-games", async (req, res) => {
       title_id: row.title_id,
       region: row.region,
       file_size: Number(row.file_size || 0),
-      sha256: row.sha256 || ""
+      sha256: row.sha256 || "",
+      downloads: 0
     }));
 
     res.json({ ok: true, games, total, page, limit, hasMore: offset + games.length < total });
@@ -1181,6 +1183,49 @@ app.get("/api/ps3-games", async (req, res) => {
     res.status(500).json({ ok: false, error: "PS3_GAMES_GET_FAIL" });
   }
 });
+
+
+// Contador global real de downloads por arquivo
+app.post("/api/games/download", async (req, res) => {
+  try {
+    const link = (req.body?.link || "").toString().trim();
+    const title = (req.body?.title || "").toString().trim();
+
+    if (!link)
+      return res.status(400).json({ ok: false, error: "LINK_REQUIRED" });
+
+    let r = await pool.query(
+      `UPDATE games
+          SET downloads = COALESCE(downloads, 0) + 1
+        WHERE link = $1
+        RETURNING id, link, downloads`,
+      [link]
+    );
+
+    if (r.rowCount === 0 && title) {
+      r = await pool.query(
+        `UPDATE games
+            SET downloads = COALESCE(downloads, 0) + 1
+          WHERE LOWER(title) = LOWER($1)
+          RETURNING id, link, downloads`,
+        [title]
+      );
+    }
+
+    if (r.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "GAME_NOT_FOUND" });
+
+    return res.json({
+      ok: true,
+      link: r.rows[0].link,
+      downloads: Number(r.rows[0].downloads || 0)
+    });
+  } catch (e) {
+    console.error("GAME_DOWNLOAD_COUNT_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "GAME_DOWNLOAD_COUNT_FAIL" });
+  }
+});
+
 
 /* 🔥 ADMIN ROUTES (AGORA SUPER ADMIN TOTAL) */
 
