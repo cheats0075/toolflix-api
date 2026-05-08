@@ -736,24 +736,32 @@ app.get("/api/me", auth, async (req, res) => {
 });
 
 app.post("/api/add-xp", auth, async (req, res) => {
-  const amount = Number(req.body?.amount || 0);
+  try {
+    const amount = Number(req.body?.amount || 0);
 
-  if (amount <= 0 || amount > 1000)
-    return res.status(400).json({ ok: false, error: "AMOUNT_INVALID" });
+    if (amount <= 0 || amount > 1000)
+      return res.status(400).json({ ok: false, error: "AMOUNT_INVALID" });
 
-  await pool.query(
-    `UPDATE users SET xp = xp + $1 WHERE id=$2`,
-    [amount, req.user.id]
-  );
+    await pool.query(
+      `UPDATE users SET xp = COALESCE(xp, 0) + $1 WHERE id=$2`,
+      [amount, req.user.id]
+    );
 
-  const r = await pool.query(
-    `SELECT xp, avatar FROM users WHERE id=$1 LIMIT 1`,
-    [req.user.id]
-  );
+    const r = await pool.query(
+      `SELECT xp, avatar FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
 
-  const xp = Number(r.rows[0]?.xp || 0);
-  const level = xpToLevel(xp);
-  res.json({ ok: true, xp, level, avatar: normalizeAvatarFilename(r.rows[0]?.avatar, level) });
+    if (r.rowCount === 0)
+      return res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
+
+    const xp = Number(r.rows[0]?.xp || 0);
+    const level = xpToLevel(xp);
+    return res.json({ ok: true, xp, level, avatar: normalizeAvatarFilename(r.rows[0]?.avatar, level) });
+  } catch (e) {
+    console.error("ADD_XP_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "ADD_XP_FAIL" });
+  }
 });
 
 app.get("/api/profile/me", auth, async (req, res) => {
@@ -1860,7 +1868,7 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
 ========================= */
 
 const CHAT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const CHAT_SPAM_MS = 30 * 1000;
+const CHAT_SPAM_MS = 3 * 1000;
 const GLOBAL_CHAT_SPAM_MS = 3 * 1000;
 const GLOBAL_CHAT_MAX_LEN = 200;
 
@@ -1905,37 +1913,42 @@ async function getOrCreateActiveChat(userId) {
 /* USER SEND */
 
 app.post("/api/chat/send", auth, async (req, res) => {
-  const text = (req.body?.message || "").toString().trim();
-  if (!text) return res.status(400).json({ ok: false });
+  try {
+    const text = (req.body?.message || "").toString().trim();
+    if (!text) return res.status(400).json({ ok: false, error: "MESSAGE_REQUIRED" });
 
-  const chat = await getOrCreateActiveChat(req.user.id);
-  const now = Date.now();
+    const chat = await getOrCreateActiveChat(req.user.id);
+    const now = Date.now();
 
-  const last = await pool.query(
-    `SELECT created_at FROM chat_messages
-     WHERE chat_id=$1 AND sender='user'
-     ORDER BY created_at DESC LIMIT 1`,
-    [chat.id]
-  );
+    const last = await pool.query(
+      `SELECT created_at FROM chat_messages
+       WHERE chat_id=$1 AND sender='user'
+       ORDER BY created_at DESC LIMIT 1`,
+      [chat.id]
+    );
 
-  if (last.rowCount > 0) {
-    const lastAt = Number(last.rows[0].created_at);
-    if (now - lastAt < CHAT_SPAM_MS)
-      return res.status(429).json({ ok: false, error: "SPAM" });
+    if (last.rowCount > 0) {
+      const lastAt = Number(last.rows[0].created_at || 0);
+      if (now - lastAt < CHAT_SPAM_MS) {
+        return res.status(429).json({ ok: false, error: "SPAM", waitMs: CHAT_SPAM_MS - (now - lastAt) });
+      }
+    }
+
+    const msgId = "m_" + Math.random().toString(36).slice(2, 10);
+
+    await pool.query(
+      `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
+       VALUES($1,$2,'user',$3,$4)`,
+      [msgId, chat.id, text, now]
+    );
+
+    await pool.query(`UPDATE chats SET last_activity_at=$1 WHERE id=$2`, [now, chat.id]);
+
+    return res.json({ ok: true, messageId: msgId, chatId: chat.id, created_at: now });
+  } catch (e) {
+    console.error("CHAT_SEND_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "CHAT_SEND_FAIL" });
   }
-
-  const msgId = "m_" + Math.random().toString(36).slice(2, 10);
-
-  await pool.query(
-    `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
-     VALUES($1,$2,'user',$3,$4)`,
-    [msgId, chat.id, text, now]
-  );
-
-  // atualiza última atividade do chat
-  await pool.query(`UPDATE chats SET last_activity_at=$1 WHERE id=$2`, [now, chat.id]);
-
-  res.json({ ok: true });
 });
 
 /* USER READ */
