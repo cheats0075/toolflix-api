@@ -1841,7 +1841,7 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       level = xpToLevel(xp);
     } else {
       const raw = senderKey.replace(/^guest:/, '');
-      const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
+      const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '') || '01';
       nick = `Usuário ${suffix}`;
       xp = 0;
       level = 1;
@@ -1855,10 +1855,22 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       [msgId, senderKey, userId, nick, xp, level, isGuest, text, now]
     );
 
-    res.json({ ok: true });
+    return res.json({
+      ok: true,
+      message: {
+        id: msgId,
+        nick,
+        xp,
+        level,
+        avatar: levelToAvatar(level),
+        is_guest: isGuest,
+        message: text,
+        created_at: now
+      }
+    });
   } catch (e) {
     console.error('GLOBAL_CHAT_SEND_FAIL:', e);
-    res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
+    return res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
   }
 });
 
@@ -1869,7 +1881,7 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
 
 const CHAT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const CHAT_SPAM_MS = 3 * 1000;
-const GLOBAL_CHAT_SPAM_MS = 3 * 1000;
+const GLOBAL_CHAT_SPAM_MS = 1000;
 const GLOBAL_CHAT_MAX_LEN = 200;
 
 async function cleanupExpiredChats() {
