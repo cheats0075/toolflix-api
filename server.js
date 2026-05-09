@@ -1777,16 +1777,20 @@ app.get("/api/visitors", async (req, res) => {
 
 app.get('/api/global-chat/messages', async (req, res) => {
   try {
+    // Pega as 100 mensagens MAIS RECENTES. Antes pegava as 100 mais antigas,
+    // então mensagens novas eram salvas mas não apareciam no Chat ToolFlix.
     const r = await pool.query(`
       SELECT id, nick, xp, level, is_guest, message, created_at
       FROM global_chat
-      ORDER BY created_at ASC
+      ORDER BY created_at DESC
       LIMIT 100
     `);
 
+    const rows = r.rows.slice().reverse();
+
     res.json({
       ok: true,
-      messages: r.rows.map(m => {
+      messages: rows.map(m => {
         const level = Number(m.level || 1);
         return {
           id: m.id,
@@ -1841,7 +1845,7 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       level = xpToLevel(xp);
     } else {
       const raw = senderKey.replace(/^guest:/, '');
-      const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '') || '01';
+      const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
       nick = `Usuário ${suffix}`;
       xp = 0;
       level = 1;
@@ -1855,22 +1859,10 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       [msgId, senderKey, userId, nick, xp, level, isGuest, text, now]
     );
 
-    return res.json({
-      ok: true,
-      message: {
-        id: msgId,
-        nick,
-        xp,
-        level,
-        avatar: levelToAvatar(level),
-        is_guest: isGuest,
-        message: text,
-        created_at: now
-      }
-    });
+    res.json({ ok: true });
   } catch (e) {
     console.error('GLOBAL_CHAT_SEND_FAIL:', e);
-    return res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
+    res.status(500).json({ ok: false, error: 'GLOBAL_CHAT_SEND_FAIL' });
   }
 });
 
