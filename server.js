@@ -33,13 +33,6 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
-app.use(express.json());
-app.use(cors({
-  origin: "*",
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-admin-key"],
-}));
-app.options("*", cors());
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "CHANGE_ME";
@@ -606,19 +599,19 @@ async function initDb() {
 
 }
 
-// 🚀 INICIA O SERVIDOR PRIMEIRO (ESSENCIAL PRO RENDER)
-app.listen(PORT, () => {
-  console.log("ToolFlix API rodando na porta", PORT);
-});
-
-// 🔥 DEPOIS INICIALIZA BANCO E PS3
+// 🚀 Inicializa banco antes de subir servidor
 initDb()
   .then(async () => {
     await importPs3GamesFromFile();
     console.log("✅ Banco e PS3 carregados");
+
+    app.listen(PORT, () => {
+      console.log("ToolFlix API rodando na porta", PORT);
+    });
   })
   .catch((e) => {
     console.error("❌ Erro initDb:", e);
+    process.exit(1);
   });
 
 app.get("/", (req, res) =>
