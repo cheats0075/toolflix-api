@@ -605,7 +605,68 @@ initDb()
     await importPs3GamesFromFile();
     console.log("✅ Banco e PS3 carregados");
 
-    app.listen(PORT, () => {
+    
+
+/* =========================
+   ADMIN SET XP
+========================= */
+
+app.post("/api/admin/set-xp", authOptional, requireAdminOrMaster, async (req, res) => {
+  try {
+
+    const nick = (req.body?.nick || "").toString().trim();
+    const xp = Number(req.body?.xp || 0);
+
+    if (!nick) {
+      return res.status(400).json({
+        ok: false,
+        error: "NICK_REQUIRED"
+      });
+    }
+
+    if (!Number.isFinite(xp) || xp < 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "INVALID_XP"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET xp = $1
+      WHERE LOWER(nick) = LOWER($2)
+      RETURNING id, nick, xp, premium
+      `,
+      [xp, nick]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({
+        ok: false,
+        error: "USER_NOT_FOUND"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      user: result.rows[0]
+    });
+
+  } catch (e) {
+
+    console.error("SET_XP_FAIL:", e);
+
+    return res.status(500).json({
+      ok: false,
+      error: "SET_XP_FAIL"
+    });
+
+  }
+});
+
+
+app.listen(PORT, () => {
       console.log("ToolFlix API rodando na porta", PORT);
     });
   })
