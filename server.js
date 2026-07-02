@@ -2152,6 +2152,78 @@ app.post(
   }
 );
 
+/* ===== ROTAS DE VIEWS / VISITAS / CONTADOR ===== */
+
+// Helper para ler e incrementar visitas
+async function getVisitCount(){ 
+  const r = await pool.query(`SELECT value FROM site_stats WHERE key='visits'`);
+  return Number(r.rows[0]?.value || 0);
+}
+async function incrementVisitCount(){
+  await pool.query(`UPDATE site_stats SET value = value + 1 WHERE key='visits'`);
+  return getVisitCount();
+}
+
+// POST /api/visits  — incrementa e retorna
+app.post("/api/visits", async (req, res) => {
+  try { const count = await incrementVisitCount(); res.json({ ok:true, count }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// POST /api/visit  — alias
+app.post("/api/visit", async (req, res) => {
+  try { const count = await incrementVisitCount(); res.json({ ok:true, count }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// POST /api/views/hit  — alias
+app.post("/api/views/hit", async (req, res) => {
+  try { const views = await incrementVisitCount(); res.json({ ok:true, views }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// POST /api/views/increment — alias
+app.post("/api/views/increment", async (req, res) => {
+  try { const views = await incrementVisitCount(); res.json({ ok:true, views }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// POST /api/stats/views/hit — alias
+app.post("/api/stats/views/hit", async (req, res) => {
+  try { const views = await incrementVisitCount(); res.json({ ok:true, views }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// POST /api/visitas/hit — alias
+app.post("/api/visitas/hit", async (req, res) => {
+  try { const total = await incrementVisitCount(); res.json({ ok:true, total }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// POST /api/analytics/visit — alias
+app.post("/api/analytics/visit", async (req, res) => {
+  try { const count = await incrementVisitCount(); res.json({ ok:true, count }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// GET /api/views — retorna total sem incrementar
+app.get("/api/views", async (req, res) => {
+  try { const views = await getVisitCount(); res.json({ ok:true, views }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// GET /api/stats/views — alias
+app.get("/api/stats/views", async (req, res) => {
+  try { const views = await getVisitCount(); res.json({ ok:true, views }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
+// GET /api/visitas — alias
+app.get("/api/visitas", async (req, res) => {
+  try { const total = await getVisitCount(); res.json({ ok:true, total }); }
+  catch(e){ res.status(500).json({ ok:false }); }
+});
+
 app.get("/api/ps3-debug", async (req, res) => {
   try {
     const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ps3_games`);
