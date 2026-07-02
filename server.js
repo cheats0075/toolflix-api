@@ -2122,6 +2122,36 @@ app.post(
 
 
 
+app.post(
+  "/api/admin/chats/open-by-nick",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const nick = (req.body?.nick || "").toString().trim();
+      if (!nick) return res.status(400).json({ ok: false, error: "NICK_REQUIRED" });
+
+      // Busca usuário pelo nick
+      const u = await pool.query(
+        `SELECT id, nick FROM users WHERE LOWER(nick)=LOWER($1) LIMIT 1`,
+        [nick]
+      );
+      if (u.rowCount === 0)
+        return res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
+
+      const user = u.rows[0];
+
+      // Cria ou reutiliza chat ativo
+      const chat = await getOrCreateActiveChat(user.id);
+
+      res.json({ ok: true, chat: { id: chat.id, nick: user.nick, user_id: user.id } });
+    } catch (e) {
+      console.error("open-by-nick error:", e);
+      res.status(500).json({ ok: false, error: "OPEN_CHAT_FAIL" });
+    }
+  }
+);
+
 app.get("/api/ps3-debug", async (req, res) => {
   try {
     const count = await pool.query(`SELECT COUNT(*)::int AS total FROM ps3_games`);
