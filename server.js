@@ -768,6 +768,7 @@ app.post("/api/login", async (req, res) => {
         nick: user.nick,
         xp: Number(user.xp || 0),
         avatar: normalizeAvatarFilename(user.avatar, xpToLevel(Number(user.xp || 0))),
+        frame: user.frame || "auto",
         password_temp: !!user.password_temp,
       },
     });
