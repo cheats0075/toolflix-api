@@ -783,12 +783,12 @@ app.post("/api/login", async (req, res) => {
 ========================= */
 
 app.get("/api/me", auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-            downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
-       FROM users WHERE id=$1 LIMIT 1`,
-    [req.user.id]
-  );
+    const r = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar,frame
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
 
   if (r.rowCount === 0)
     return res.status(404).json({ ok: false, error: "NOT_FOUND" });
