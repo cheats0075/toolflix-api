@@ -246,6 +246,7 @@ function buildProfileStatsRow(row) {
     xp,
     level,
     avatar: normalizeAvatarFilename(row?.avatar, level),
+    frame: row?.frame || "auto",
     premium: !!row.premium,
     premiumUntil: row.premium_until ? Number(row.premium_until) : null,
     passwordTemp: !!row.password_temp,
@@ -395,7 +396,8 @@ async function initDb() {
     ADD COLUMN IF NOT EXISTS last_login_at BIGINT,
     ADD COLUMN IF NOT EXISTS password_temp BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN IF NOT EXISTS password_temp_set_at BIGINT,
-    ADD COLUMN IF NOT EXISTS avatar TEXT;
+    ADD COLUMN IF NOT EXISTS avatar TEXT,
+    ADD COLUMN IF NOT EXISTS frame TEXT DEFAULT 'auto';
   `);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS users_premium_idx ON users(premium);`);
@@ -585,6 +587,11 @@ async function initDb() {
       message TEXT NOT NULL,
       created_at BIGINT NOT NULL
     );
+  `);
+
+  await pool.query(`
+    ALTER TABLE global_chat
+    ADD COLUMN IF NOT EXISTS frame TEXT DEFAULT 'auto';
   `);
 
   await pool.query(`
@@ -846,7 +853,7 @@ app.get("/api/profile/:nick", async (req, res) => {
     const nick = (req.params.nick || "").toString().trim();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar,frame
          FROM users
          WHERE LOWER(nick)=LOWER($1)
          LIMIT 1`,
@@ -900,6 +907,39 @@ app.post("/api/profile/avatar", auth, async (req, res) => {
   } catch (e) {
     console.error("PROFILE_AVATAR_FAIL:", e);
     return res.status(500).json({ ok: false, error: "PROFILE_AVATAR_FAIL" });
+  }
+});
+
+app.post("/api/profile/frame", auth, async (req, res) => {
+  try {
+    const frame = (req.body?.frame || "auto").toString().trim();
+    const validFrames = ["auto", "none", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"];
+    if (!validFrames.includes(frame)) {
+      return res.status(400).json({ ok: false, error: "INVALID_FRAME" });
+    }
+
+    const userR = await pool.query(`SELECT xp FROM users WHERE id=$1 LIMIT 1`, [req.user.id]);
+    if (userR.rowCount === 0) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const level = xpToLevel(Number(userR.rows[0].xp || 0));
+    const numFrame = parseInt(frame);
+    if (!isNaN(numFrame) && numFrame > level) {
+      return res.status(403).json({ ok: false, error: "FRAME_LOCKED", needLevel: numFrame, currentLevel: level });
+    }
+
+    await pool.query(`UPDATE users SET frame=$2 WHERE id=$1`, [req.user.id, frame]);
+
+    const r = await pool.query(
+      `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar,frame
+         FROM users WHERE id=$1 LIMIT 1`,
+      [req.user.id]
+    );
+
+    return res.json({ ok: true, profile: buildProfileStatsRow(r.rows[0]) });
+  } catch (e) {
+    console.error("PROFILE_FRAME_FAIL:", e);
+    return res.status(500).json({ ok: false, error: "PROFILE_FRAME_FAIL" });
   }
 });
 
@@ -1834,7 +1874,7 @@ app.get('/api/global-chat/messages', async (req, res) => {
     // Pega as 100 mensagens MAIS RECENTES. Antes pegava as 100 mais antigas,
     // então mensagens novas eram salvas mas não apareciam no Chat ToolFlix.
     const r = await pool.query(`
-      SELECT id, nick, xp, level, is_guest, message, created_at
+      SELECT id, nick, xp, level, is_guest, message, created_at, frame
       FROM global_chat
       ORDER BY created_at DESC
       LIMIT 100
@@ -1852,6 +1892,7 @@ app.get('/api/global-chat/messages', async (req, res) => {
           xp: Number(m.xp || 0),
           level,
           avatar: levelToAvatar(level),
+          frame: m.frame || 'auto',
           is_guest: !!m.is_guest,
           message: m.message,
           created_at: Number(m.created_at || 0)
@@ -1891,12 +1932,14 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
     let xp = 0;
     let level = 1;
     let isGuest = !userId;
+    let frame = 'auto';
 
     if (userId) {
-      const ur = await pool.query(`SELECT nick, xp FROM users WHERE id=$1 LIMIT 1`, [userId]);
+      const ur = await pool.query(`SELECT nick, xp, frame FROM users WHERE id=$1 LIMIT 1`, [userId]);
       nick = ur.rows[0]?.nick || nick || 'Usuário';
       xp = Number(ur.rows[0]?.xp || 0);
       level = xpToLevel(xp);
+      frame = ur.rows[0]?.frame || 'auto';
     } else {
       const raw = senderKey.replace(/^guest:/, '');
       const suffix = raw.slice(-2).padStart(2, '0').replace(/\s/g, '');
@@ -1904,13 +1947,14 @@ app.post('/api/global-chat/send', authOptional, async (req, res) => {
       xp = 0;
       level = 1;
       isGuest = true;
+      frame = 'none';
     }
 
     const msgId = 'gc_' + Math.random().toString(36).slice(2, 10);
     await pool.query(
-      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,is_guest,message,created_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-      [msgId, senderKey, userId, nick, xp, level, isGuest, text, now]
+      `INSERT INTO global_chat(id,sender_key,user_id,nick,xp,level,is_guest,message,created_at,frame)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [msgId, senderKey, userId, nick, xp, level, isGuest, text, now, frame]
     );
 
     res.json({ ok: true });
