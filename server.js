@@ -604,6 +604,27 @@ async function initDb() {
     ON global_chat(sender_key, created_at DESC);
   `);
 
+  /* =========================
+     PROMOS (Shopee affiliate)
+  ========================= */
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS promos(
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      image TEXT DEFAULT '',
+      link TEXT NOT NULL,
+      price_old TEXT DEFAULT '',
+      price_new TEXT DEFAULT '',
+      created_at BIGINT NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS promos_link_unique
+    ON promos(link);
+  `);
+
 }
 
 // 🚀 Inicializa banco antes de subir servidor
@@ -1330,6 +1351,23 @@ app.post("/api/games/download", async (req, res) => {
 });
 
 
+/* =========================
+   PROMOS (Shopee affiliate)
+========================= */
+
+app.get("/api/promos", async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, name, image, link, price_old, price_new, created_at
+       FROM promos ORDER BY created_at DESC`
+    );
+    res.json({ ok: true, promos: r.rows });
+  } catch (e) {
+    console.error("PROMOS_GET_FAIL:", e);
+    res.status(500).json({ ok: false, error: "PROMOS_GET_FAIL" });
+  }
+});
+
 /* 🔥 ADMIN ROUTES (AGORA SUPER ADMIN TOTAL) */
 
 // Limpar jogos
@@ -1423,6 +1461,67 @@ app.post(
     }
   }
 );
+
+// Criar promoção
+app.post(
+  "/api/admin/promos",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      const name = (body.name || "").toString().trim();
+      const image = (body.image || "").toString().trim();
+      const link = (body.link || "").toString().trim();
+      const priceOld = (body.price_old || "").toString().trim();
+      const priceNew = (body.price_new || "").toString().trim();
+
+      if (!name || !link)
+        return res.status(400).json({ ok: false, error: "name e link obrigatórios" });
+
+      const id = "promo_" + Math.random().toString(36).slice(2, 10);
+
+      await pool.query(
+        `
+        INSERT INTO promos(id,name,image,link,price_old,price_new,created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (link) DO UPDATE
+        SET name = EXCLUDED.name,
+            image = EXCLUDED.image,
+            price_old = EXCLUDED.price_old,
+            price_new = EXCLUDED.price_new
+        `,
+        [id, name, image, link, priceOld, priceNew, Date.now()]
+      );
+
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("ADMIN_PROMOS_FAIL:", e);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
+
+// Deletar promoção
+app.post(
+  "/api/admin/promos/delete",
+  authOptional,
+  requireAdminOrMaster,
+  async (req, res) => {
+    try {
+      const { id } = req.body || {};
+      if (!id)
+        return res.status(400).json({ ok: false, error: "id obrigatório" });
+
+      await pool.query(`DELETE FROM promos WHERE id=$1`, [String(id).trim()]);
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("DELETE_PROMO_FAIL:", e);
+      res.status(500).json({ ok: false });
+    }
+  }
+);
+
 /* =========================
    TOKENS + PREMIUM
 ========================= */
