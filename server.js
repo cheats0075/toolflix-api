@@ -36,6 +36,8 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "CHANGE_ME";
 const JWT_SECRET = process.env.JWT_SECRET || "TOOLFLIX_SECRET_123";
+if (ADMIN_KEY === "CHANGE_ME") console.warn("⚠️ ADMIN_KEY usando valor padrão! Configure ADMIN_KEY no Render.");
+if (JWT_SECRET === "TOOLFLIX_SECRET_123") console.warn("⚠️ JWT_SECRET usando valor padrão! Configure JWT_SECRET no Render.");
 
 // 👑 SUPER ADMIN FIXO
 const MASTER_NICK = "Srgokucheats";
@@ -130,7 +132,6 @@ function getVisitorKey(req) {
 }
 
 const ONLINE_WINDOW_MS = 2 * 60 * 1000;
-
 async function cleanupExpiredPremiumAccounts() {
   const now = Date.now();
   await pool.query(`
@@ -520,6 +521,17 @@ initDb()
 
     
 
+
+
+app.listen(PORT, () => {
+      console.log("ToolFlix API rodando na porta", PORT);
+    });
+  })
+  .catch((e) => {
+    console.error("❌ Erro initDb:", e);
+    process.exit(1);
+  });
+
 /* =========================
    ADMIN SET XP
 ========================= */
@@ -578,15 +590,6 @@ app.post("/api/admin/set-xp", authOptional, requireAdminOrMaster, async (req, re
   }
 });
 
-
-app.listen(PORT, () => {
-      console.log("ToolFlix API rodando na porta", PORT);
-    });
-  })
-  .catch((e) => {
-    console.error("❌ Erro initDb:", e);
-    process.exit(1);
-  });
 
 app.get("/", (req, res) =>
   res.json({ ok: true, name: "ToolFlix API" })
@@ -737,7 +740,7 @@ app.get("/api/profile/me", auth, async (req, res) => {
     await cleanupExpiredPremiumAccounts();
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar,frame
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -786,7 +789,7 @@ app.post("/api/profile/avatar", auth, async (req, res) => {
 
     const userR = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar,frame
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -805,7 +808,7 @@ app.post("/api/profile/avatar", auth, async (req, res) => {
 
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar,frame
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -879,7 +882,7 @@ app.post("/api/profile/action", auth, async (req, res) => {
 
     const r = await pool.query(
       `SELECT id,nick,xp,premium,premium_until,created_at,last_login_at,
-              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar
+              downloads_count,favorites_count,themes_count,youtube_count,password_temp,avatar,frame
          FROM users WHERE id=$1 LIMIT 1`,
       [req.user.id]
     );
@@ -1389,11 +1392,11 @@ app.post(
   }
 );
 
-app.post("/api/validar-token", async (req, res) => {
+app.post("/api/validar-token", auth, async (req, res) => {
   const client = await pool.connect();
   try {
     const token = (req.body?.token || "").toString().trim().toUpperCase();
-    const userId = (req.body?.userId || "").toString().trim();
+    const userId = req.user.id;
 
     if (!token || !userId) {
       return res.status(400).json({ ok: false, reason: "TOKEN_OU_USUARIO_INVALIDO" });
@@ -1745,19 +1748,21 @@ app.get("/api/visitors", async (req, res) => {
     const onlineMin = now - ONLINE_WINDOW_MS;
 
     const onlineR = await pool.query(
-      `SELECT nick, xp, is_guest, last_seen_at
-       FROM site_visitors
-       WHERE last_seen_at >= $1
-       ORDER BY last_seen_at DESC
+      `SELECT sv.nick, sv.xp, sv.is_guest, sv.last_seen_at, u.avatar
+       FROM site_visitors sv
+       LEFT JOIN users u ON u.id = sv.user_id
+       WHERE sv.last_seen_at >= $1
+       ORDER BY sv.last_seen_at DESC
        LIMIT 50`,
       [onlineMin]
     );
 
     const lastSeenR = await pool.query(
-      `SELECT nick, xp, is_guest, last_seen_at
-       FROM site_visitors
-       WHERE last_seen_at < $1
-       ORDER BY last_seen_at DESC
+      `SELECT sv.nick, sv.xp, sv.is_guest, sv.last_seen_at, u.avatar
+       FROM site_visitors sv
+       LEFT JOIN users u ON u.id = sv.user_id
+       WHERE sv.last_seen_at < $1
+       ORDER BY sv.last_seen_at DESC
        LIMIT 10`,
       [onlineMin]
     );
@@ -1772,7 +1777,7 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar: levelToAvatar(level),
+          avatar: normalizeAvatarFilename(r.avatar, level),
           is_guest: !!r.is_guest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1784,7 +1789,7 @@ app.get("/api/visitors", async (req, res) => {
           nick: r.nick,
           xp,
           level,
-          avatar: levelToAvatar(level),
+          avatar: normalizeAvatarFilename(r.avatar, level),
           is_guest: !!r.is_guest,
           last_seen_at: Number(r.last_seen_at || 0),
         };
@@ -1806,9 +1811,10 @@ app.get('/api/global-chat/messages', async (req, res) => {
     // Pega as 100 mensagens MAIS RECENTES. Antes pegava as 100 mais antigas,
     // então mensagens novas eram salvas mas não apareciam no Chat ToolFlix.
     const r = await pool.query(`
-      SELECT id, nick, xp, level, is_guest, message, created_at, frame
-      FROM global_chat
-      ORDER BY created_at DESC
+      SELECT gc.id, gc.nick, gc.xp, gc.level, gc.is_guest, gc.message, gc.created_at, gc.frame, u.avatar
+      FROM global_chat gc
+      LEFT JOIN users u ON u.id = gc.user_id
+      ORDER BY gc.created_at DESC
       LIMIT 100
     `);
 
@@ -1823,7 +1829,7 @@ app.get('/api/global-chat/messages', async (req, res) => {
           nick: m.nick,
           xp: Number(m.xp || 0),
           level,
-          avatar: levelToAvatar(level),
+          avatar: normalizeAvatarFilename(m.avatar, level),
           frame: m.frame || 'auto',
           is_guest: !!m.is_guest,
           message: m.message,
@@ -2288,12 +2294,6 @@ async function incrementVisitCount(){
   await pool.query(`UPDATE site_stats SET value = value + 1 WHERE key='visits'`);
   return getVisitCount();
 }
-
-// POST /api/visits  — incrementa e retorna
-app.post("/api/visits", async (req, res) => {
-  try { const count = await incrementVisitCount(); res.json({ ok:true, count }); }
-  catch(e){ res.status(500).json({ ok:false }); }
-});
 
 // POST /api/visit  — alias
 app.post("/api/visit", async (req, res) => {
