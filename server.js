@@ -11,6 +11,7 @@ const fs = require("fs");
 const path = require("path");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 
 const app = express();
 const corsOptions = {
@@ -524,6 +525,15 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS premium_users(
       user_id TEXT PRIMARY KEY,
       since BIGINT NOT NULL
+    );
+  `);
+
+  // 🤖 Bot de token: 1 token por usuário (user_id é chave primária)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS token_requests(
+      user_id TEXT PRIMARY KEY,
+      token TEXT NOT NULL,
+      created_at BIGINT NOT NULL
     );
   `);
   /* =========================
@@ -2112,6 +2122,138 @@ async function getOrCreateActiveChat(userId) {
   return { id: chatId, expires_at: expiresAt };
 }
 
+
+/* =========================
+   🤖 BOT DE TOKEN (chat privado)
+   Usuário digita !token -> recebe 1 token de 150 dias (uma vez por usuário)
+========================= */
+
+const BOT_TOKEN_COMMAND = "!token";
+const BOT_TOKEN_DAYS = 150;
+const BOT_NAME = "🤖 Bot ToolFlix";
+
+function generateBotToken() {
+  // crypto.randomBytes = aleatório seguro (Math.random é previsível)
+  const part = () => crypto.randomBytes(3).toString("hex").toUpperCase();
+  return "TFX-" + part() + "-" + part();
+}
+
+function formatDateBR(ms) {
+  try {
+    return new Date(Number(ms)).toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo" });
+  } catch (e) {
+    return new Date(Number(ms)).toISOString().slice(0, 10);
+  }
+}
+
+async function botSendMessage(chatId, text, afterTime) {
+  const msgId = "m_" + Math.random().toString(36).slice(2, 10);
+  // garante que a resposta do bot fique depois da mensagem do usuário
+  const createdAt = Math.max(Date.now(), Number(afterTime || 0) + 1);
+
+  await pool.query(
+    `INSERT INTO chat_messages(id,chat_id,sender,message,created_at)
+     VALUES($1,$2,'admin',$3,$4)`,
+    [msgId, chatId, text, createdAt]
+  );
+  await pool.query(`UPDATE chats SET last_activity_at=$1 WHERE id=$2`, [createdAt, chatId]);
+}
+
+async function botHandleTokenCommand(userId, chatId, userMsgTime) {
+  const now = Date.now();
+  const expiresAt = now + BOT_TOKEN_DAYS * 24 * 60 * 60 * 1000;
+
+  // 1) Se já é Premium ativo, não gasta o token (evita encurtar o premium que ele já tem)
+  const ur = await pool.query(
+    `SELECT premium, premium_until FROM users WHERE id=$1 LIMIT 1`,
+    [userId]
+  );
+  const u = ur.rows[0];
+  if (u && u.premium && (!u.premium_until || Number(u.premium_until) > now)) {
+    await botSendMessage(
+      chatId,
+      `${BOT_NAME}\n\n💎 Você já é Premium! Quando o seu Premium acabar, digite ${BOT_TOKEN_COMMAND} aqui para receber seu token.`,
+      userMsgTime
+    );
+    return true;
+  }
+
+  // 2) Tenta reservar o token único deste usuário (atômico: só 1 pedido passa)
+  const client = await pool.connect();
+  let newToken = null;
+  try {
+    await client.query("BEGIN");
+
+    const candidate = generateBotToken();
+    const claim = await client.query(
+      `INSERT INTO token_requests(user_id,token,created_at)
+       VALUES($1,$2,$3)
+       ON CONFLICT (user_id) DO NOTHING
+       RETURNING token`,
+      [userId, candidate, now]
+    );
+
+    if (claim.rowCount === 1) {
+      await client.query(
+        `INSERT INTO tokens(token,created_at,expires_at,used_by,used_at)
+         VALUES($1,$2,$3,NULL,NULL)`,
+        [candidate, now, expiresAt]
+      );
+      newToken = candidate;
+    }
+
+    await client.query("COMMIT");
+  } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+
+  // 3) Primeira vez: entrega o token
+  if (newToken) {
+    await botSendMessage(
+      chatId,
+      `${BOT_NAME}\n\n🎁 Seu token Premium chegou!\n\n` +
+      `🔑 Token: ${newToken}\n` +
+      `⏳ Validade: ${BOT_TOKEN_DAYS} dias (até ${formatDateBR(expiresAt)})\n\n` +
+      `Como ativar: clique em 💎 Premium, cole o token e confirme.\n\n` +
+      `⚠️ Cada conta recebe apenas 1 token.`,
+      userMsgTime
+    );
+    return true;
+  }
+
+  // 4) Já pediu antes: se o token ainda está válido e não foi usado, mostra de novo
+  const prev = await pool.query(
+    `SELECT tr.token, t.used_by, t.expires_at
+       FROM token_requests tr
+       LEFT JOIN tokens t ON t.token = tr.token
+      WHERE tr.user_id=$1
+      LIMIT 1`,
+    [userId]
+  );
+  const p = prev.rows[0];
+
+  if (p && p.expires_at && !p.used_by && Number(p.expires_at) > now) {
+    await botSendMessage(
+      chatId,
+      `${BOT_NAME}\n\n⚠️ Você já pediu seu token e ele ainda não foi usado.\n\n` +
+      `🔑 Token: ${p.token}\n` +
+      `⏳ Válido até ${formatDateBR(p.expires_at)}\n\n` +
+      `Clique em 💎 Premium, cole o token e confirme.`,
+      userMsgTime
+    );
+  } else {
+    await botSendMessage(
+      chatId,
+      `${BOT_NAME}\n\n⚠️ Você já recebeu seu token. Cada conta pode receber apenas 1.`,
+      userMsgTime
+    );
+  }
+  return true;
+}
+
 /* USER SEND */
 
 app.post("/api/chat/send", auth, async (req, res) => {
@@ -2146,7 +2288,24 @@ app.post("/api/chat/send", auth, async (req, res) => {
 
     await pool.query(`UPDATE chats SET last_activity_at=$1 WHERE id=$2`, [now, chat.id]);
 
-    return res.json({ ok: true, messageId: msgId, chatId: chat.id, created_at: now });
+    // 🤖 Bot: se a mensagem for exatamente !token, responde automaticamente
+    let botReplied = false;
+    if (text.toLowerCase() === BOT_TOKEN_COMMAND) {
+      try {
+        botReplied = await botHandleTokenCommand(req.user.id, chat.id, now);
+      } catch (botErr) {
+        console.error("BOT_TOKEN_FAIL:", botErr);
+        try {
+          await botSendMessage(
+            chat.id,
+            `${BOT_NAME}\n\n❌ Não consegui gerar seu token agora. Tente novamente em instantes.`,
+            now
+          );
+        } catch (e2) { /* ignora */ }
+      }
+    }
+
+    return res.json({ ok: true, messageId: msgId, chatId: chat.id, created_at: now, bot: botReplied });
   } catch (e) {
     console.error("CHAT_SEND_FAIL:", e);
     return res.status(500).json({ ok: false, error: "CHAT_SEND_FAIL" });
