@@ -1144,6 +1144,42 @@ app.get("/api/games", async (req, res) => {
 
 
 
+/* =========================
+   RANKING (TOP XP)
+========================= */
+
+app.get("/api/ranking", async (req, res) => {
+  try {
+    const limit = Math.min(100, Math.max(1, Number(req.query?.limit || 50) || 50));
+    const r = await pool.query(
+      `SELECT nick, xp, premium, avatar, frame
+         FROM users
+         ORDER BY xp DESC, created_at ASC
+         LIMIT $1`,
+      [limit]
+    );
+
+    const ranking = r.rows.map((row, i) => {
+      const xp = Number(row.xp || 0);
+      const level = xpToLevel(xp);
+      return {
+        pos: i + 1,
+        nick: row.nick,
+        xp,
+        level,
+        avatar: normalizeAvatarFilename(row.avatar, level),
+        frame: row.frame || "auto",
+        premium: !!row.premium,
+      };
+    });
+
+    res.json({ ok: true, ranking });
+  } catch (e) {
+    console.error("RANKING_FAIL:", e);
+    res.status(500).json({ ok: false, error: "RANKING_FAIL" });
+  }
+});
+
 // Contador global real de downloads por arquivo
 app.post("/api/games/download", async (req, res) => {
   try {
